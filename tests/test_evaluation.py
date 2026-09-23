@@ -189,8 +189,8 @@ class TestJobEvaluation(unittest.TestCase):
         norm = normalize_job(raw)
         result = evaluate_job(norm, self.profile)
 
-        # AI relevance score must be minimal (2.0) rather than 25.0
-        self.assertEqual(result.score_breakdown.ai_relevance, 2.0)
+        # AI relevance score must be 0.0 (non-technical) rather than elevated AI score
+        self.assertEqual(result.score_breakdown.ai_relevance, 0.0)
         self.assertNotEqual(result.recommendation, Recommendation.APPLY)
         self.assertTrue(any("Non-technical role" in c for c in result.concerns))
 
@@ -209,7 +209,7 @@ class TestJobEvaluation(unittest.TestCase):
         result = evaluate_job(norm, self.profile)
 
         self.assertNotIn("AI", norm.technical_keywords)
-        self.assertEqual(result.score_breakdown.ai_relevance, 2.0)
+        self.assertEqual(result.score_breakdown.ai_relevance, 0.0)
 
 
 if __name__ == "__main__":

@@ -24,7 +24,7 @@ def format_markdown_report(evaluations: List[EvaluationResult]) -> str:
         lines.append(f"- **Employment Type**: {job.employment_type.value.replace('_', ' ').capitalize()}")
         lines.append(f"- **Salary**: {job.salary or 'Not stated'}")
         lines.append(f"- **Match Score**: **{ev.total_score}/100**")
-        lines.append(f"- **Score Breakdown**: AI/ML: {sb.ai_relevance}/25 | Student/Exp: {sb.student_compatibility}/20 | Location: {sb.location_compatibility}/15 | Schedule: {sb.schedule_compatibility}/15 | Education: {sb.education_compatibility}/10 | Tech Skills: {sb.technical_skill_overlap}/10 | Language: {sb.language_compatibility}/5")
+        lines.append(f"- **Score Breakdown**: Domain: {sb.ai_relevance}/40 | Tech Skills: {sb.technical_skill_overlap}/15 | Student/Exp: {sb.student_compatibility}/20 | Schedule: {sb.schedule_compatibility}/10 | Location: {sb.location_compatibility}/10 | Language: {sb.language_compatibility}/5")
         lines.append("")
 
         lines.append("### WHY IT MATCHES")

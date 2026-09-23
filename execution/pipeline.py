@@ -21,11 +21,16 @@ DEFAULT_DISCOVERY_QUERIES = [
     "ai",
     "dirbtinis intelektas",
     "machine learning",
+    "ml",
+    "genai",
+    "llm",
+    "ai agents",
+    "automation",
     "python",
+    "data science",
     "duomenų",
-    "praktika",
-    "junior",
-    "ai automation"
+    "nlp",
+    "it praktika"
 ]
 
 
