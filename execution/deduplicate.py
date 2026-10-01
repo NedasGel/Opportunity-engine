@@ -1,5 +1,6 @@
 from typing import List, Dict
 from .models import NormalizedJob, EvidenceItem, FactType
+from .normalize import normalize_company, normalize_title
 
 
 def deduplicate_jobs(jobs: List[NormalizedJob]) -> List[NormalizedJob]:
@@ -12,8 +13,8 @@ def deduplicate_jobs(jobs: List[NormalizedJob]) -> List[NormalizedJob]:
 
     for job in jobs:
         # Canonical deduplication key: company + normalized_title + location
-        comp_key = job.company.lower().strip()
-        title_key = job.normalized_title.strip()
+        comp_key = normalize_company(job.company)
+        title_key = normalize_title(job.normalized_title or job.title)
         loc_key = job.location.lower().strip()
         canonical_key = f"{comp_key}|{title_key}|{loc_key}"
 
@@ -23,6 +24,20 @@ def deduplicate_jobs(jobs: List[NormalizedJob]) -> List[NormalizedJob]:
             matched_id = url_to_id[job.job_url]
         elif canonical_key in deduped_map:
             matched_id = canonical_key
+        else:
+            # Fallback for compatible location (e.g. Vilnius vs Lithuania/Unknown) with identical company & title
+            for existing_key, existing_job in deduped_map.items():
+                existing_comp = normalize_company(existing_job.company)
+                existing_title = normalize_title(existing_job.normalized_title or existing_job.title)
+                if comp_key == existing_comp and title_key == existing_title:
+                    existing_loc = existing_job.location.lower().strip()
+                    if (existing_loc == loc_key or
+                        existing_loc in {"lithuania", "unknown"} or
+                        loc_key in {"lithuania", "unknown"}):
+                        matched_id = existing_key
+                        if existing_loc in {"lithuania", "unknown"} and loc_key not in {"lithuania", "unknown"}:
+                            existing_job.location = job.location
+                        break
 
         if matched_id and matched_id in deduped_map:
             existing = deduped_map[matched_id]

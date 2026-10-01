@@ -2,7 +2,8 @@ import unittest
 from execution.models import RawJobListing, WorkMode, EmploymentType
 from execution.normalize import (
     normalize_job, clean_url, detect_work_mode, detect_employment_type,
-    extract_education_rules, extract_experience_rules
+    extract_education_rules, extract_experience_rules,
+    normalize_company, normalize_title, normalize_location
 )
 
 
@@ -117,6 +118,49 @@ class TestJobNormalization(unittest.TestCase):
         desc_arch = "Lead the team and coach junior developers."
         title_arch = "Lead Cloud Architect"
         self.assertEqual(detect_employment_type(desc_arch, title_arch), EmploymentType.FULL_TIME)
+
+    def test_normalize_company(self):
+        # Ignitis variations
+        self.assertEqual(normalize_company("Ignitis grupė"), "ignitis")
+        self.assertEqual(normalize_company("Ignitis Group"), "ignitis")
+        self.assertEqual(normalize_company("UAB Ignitis grupė"), "ignitis")
+        self.assertEqual(normalize_company("Ignitis Group, AB"), "ignitis")
+        self.assertEqual(normalize_company('AB „Ignitis grupė“'), "ignitis")
+
+        # EY variations
+        self.assertEqual(normalize_company("EY"), "ey")
+        self.assertEqual(normalize_company("Ernst & Young"), "ey")
+        self.assertEqual(normalize_company("Ernst & Young Baltic, UAB"), "ey")
+        self.assertEqual(normalize_company('UAB „Ernst & Young Baltic“'), "ey")
+        self.assertEqual(normalize_company("EY Lithuania"), "ey")
+        self.assertEqual(normalize_company("EY Baltic"), "ey")
+
+        # Corporate suffixes stripped
+        self.assertEqual(normalize_company("Acme Corp"), "acme")
+        self.assertEqual(normalize_company("Enterprise AI Corp"), "enterprise ai")
+
+        # Distinct brands preserved
+        self.assertEqual(normalize_company("Baltic AI Hub"), "baltic ai hub")
+        self.assertEqual(normalize_company("Baltic AI Labs"), "baltic ai labs")
+        self.assertEqual(normalize_company("AI Baltic"), "ai baltic")
+
+    def test_normalize_title(self):
+        # Gender/diversity tags stripped
+        self.assertEqual(normalize_title("AI ENGINEER (F/M/D)"), "ai engineer")
+        self.assertEqual(normalize_title("AI Engineer (m/f/d)"), "ai engineer")
+        self.assertEqual(normalize_title("AI Engineer (f/m/x)"), "ai engineer")
+        self.assertEqual(normalize_title("AI ENGINEER (gn)"), "ai engineer")
+        self.assertEqual(normalize_title("AI Engineer (all genders)"), "ai engineer")
+        self.assertEqual(normalize_title("AI Engineer"), "ai engineer")
+
+        # Core distinctions preserved
+        self.assertEqual(normalize_title("Junior AI Developer"), "junior ai developer")
+        self.assertEqual(normalize_title("Senior AI Architect"), "senior ai architect")
+        self.assertNotEqual(normalize_title("Junior AI Developer"), normalize_title("Senior AI Developer"))
+
+        # Equivalent formatting
+        self.assertEqual(normalize_title("Data & Analytics Specialist"), "data and analytics specialist")
+        self.assertEqual(normalize_title("Data and Analytics Specialist"), "data and analytics specialist")
 
 
 if __name__ == "__main__":

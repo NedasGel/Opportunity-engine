@@ -28,10 +28,60 @@ def clean_url(url: Optional[str]) -> Optional[str]:
         return url
 
 
+def normalize_company(name: str) -> str:
+    """
+    Normalizes company entity names for cross-source matching and deduplication.
+    Removes corporate legal suffixes, entity grouping noise, punctuation,
+    and maps known brand aliases (e.g., 'Ignitis grupė' -> 'ignitis', 'Ernst & Young' -> 'ey').
+    """
+    if not name or not isinstance(name, str):
+        return ""
+    c = name.lower()
+    c = c.replace("&", " and ")
+    c = re.sub(r'[\"\'„“”‘’`\(\)\[\]\{\}\<\>\,\.\;\:\-\–\—\_\/\\\|\*\+\@]', ' ', c)
+    tokens = [t for t in re.split(r'\s+', c) if t]
+    legal_forms = {
+        'uab', 'ab', 'mb', 'vsi', 'všį', 'ii', 'iį', 'tub', 'tūb', 'kub', 'kūb',
+        'inc', 'incorporated', 'llc', 'ltd', 'limited', 'corp', 'corporation',
+        'gmbh', 'ag', 'sa', 'sas', 'oy', 'as', 'plc', 'co', 'company',
+        'sia', 'ou', 'oü', 'spzoo'
+    }
+    entity_noise = {'group', 'grupė', 'grupe', 'holding', 'holdings'}
+    noise = legal_forms | entity_noise
+    filtered = [t for t in tokens if t not in noise]
+    if not filtered:
+        filtered = tokens
+    geo_tokens = {'lietuva', 'lithuania', 'baltic', 'baltics'}
+    if len(filtered) > 1 and filtered[-1] in geo_tokens and len(''.join(filtered[:-1])) >= 3:
+        filtered = filtered[:-1]
+    res = ' '.join(filtered)
+    brand_map = {
+        'ernst and young': 'ey',
+        'ernst young': 'ey',
+        'ey baltic': 'ey',
+        'ey baltics': 'ey',
+        'ey lithuania': 'ey',
+        'ey lietuva': 'ey',
+        'pwc': 'pwc',
+        'pricewaterhousecoopers': 'pwc',
+        'kpmg baltics': 'kpmg',
+        'kpmg lietuva': 'kpmg',
+    }
+    return brand_map.get(res, res)
+
+
 def normalize_title(title: str) -> str:
     """Normalizes title string for deduplication and matching."""
     t = title.lower()
-    t = re.sub(r'[\(\)\[\]\/\\,\-\|\:]', ' ', t)
+    # Strip gender/diversity neutrality tags like (F/M/D), [m/f/d], (m/w/d), (f/m/x), (gn), (all genders), etc.
+    t = re.sub(r'\(\s*[fmdwx\s\/\\]+\s*\)', ' ', t)
+    t = re.sub(r'\[\s*[fmdwx\s\/\\]+\s*\]', ' ', t)
+    t = re.sub(r'\b[fmdwx]\s*[\/\\]\s*[fmdwx](?:\s*[\/\\]\s*[fmdwx])?\b', ' ', t)
+    t = re.sub(r'\(\s*(?:all\s+genders|gn)\s*\)', ' ', t)
+    # Standardize & to and
+    t = t.replace('&', ' and ')
+    # Clean punctuation and brackets
+    t = re.sub(r'[\(\)\[\]\{\}\/\\,\-\–\—\|\:\;\.\"\”\“\’\'\`\•\·\*\~]', ' ', t)
     t = re.sub(r'\s+', ' ', t).strip()
     return t
 
@@ -241,7 +291,49 @@ def normalize_location(location: str) -> str:
     loc = re.sub(r'\([^\)]*\)', '', loc)  # Remove (Hybrid), (Remote), etc.
     loc = re.sub(r'[\,\-\|\/]', ' ', loc)
     loc = re.sub(r'\s+', ' ', loc).strip()
-    return loc.capitalize() if loc else "Unknown"
+    if not loc:
+        return "Unknown"
+
+    city_canonical_map = {
+        "vilnius": "Vilnius", "vilniuje": "Vilnius", "vilniaus": "Vilnius",
+        "kaunas": "Kaunas", "kaune": "Kaunas", "kauno": "Kaunas",
+        "klaipėda": "Klaipėda", "klaipėdoje": "Klaipėda", "klaipėdos": "Klaipėda",
+        "klaipeda": "Klaipėda", "klaipedoje": "Klaipėda",
+        "šiauliai": "Šiauliai", "šiauliuose": "Šiauliai", "šiaulių": "Šiauliai",
+        "siauliai": "Šiauliai", "siauliuose": "Šiauliai",
+        "panevėžys": "Panevėžys", "panevėžyje": "Panevėžys", "panevėžio": "Panevėžys",
+        "panevezys": "Panevėžys", "panevezyje": "Panevėžys",
+        "alytus": "Alytus", "alytuje": "Alytus", "alytaus": "Alytus",
+        "marijampolė": "Marijampolė", "marijampolėje": "Marijampolė",
+        "marijampole": "Marijampolė", "marijampoleje": "Marijampolė",
+        "mažeikiai": "Mažeikiai", "mažeikiuose": "Mažeikiai",
+        "mazeikiai": "Mažeikiai", "mazeikiuose": "Mažeikiai",
+        "jonava": "Jonava", "jonavoje": "Jonava",
+        "utena": "Utena", "utenoje": "Utena",
+        "kėdainiai": "Kėdainiai", "kėdainiuose": "Kėdainiai",
+        "kedainiai": "Kėdainiai", "kedainiuose": "Kėdainiai",
+        "tauragė": "Tauragė", "tauragėje": "Tauragė",
+        "taurage": "Tauragė", "taurageje": "Tauragė",
+        "telšiai": "Telšiai", "telšiuose": "Telšiai",
+        "telsiai": "Telšiai", "telsiuose": "Telšiai",
+        "ukmergė": "Ukmergė", "ukmergėje": "Ukmergė",
+        "ukmerge": "Ukmergė", "ukmergeje": "Ukmergė",
+        "visaginas": "Visaginas", "visagine": "Visaginas",
+        "palanga": "Palanga", "palangoje": "Palanga",
+        "plungė": "Plungė", "plungėje": "Plungė",
+        "plunge": "Plungė", "plungeje": "Plungė"
+    }
+    for word, canonical_city in city_canonical_map.items():
+        if re.search(r'\b' + re.escape(word) + r'\b', loc):
+            return canonical_city
+
+    if re.search(r'\b(?:lietuva|lietuvoje|lithuania|lithuanian)\b', loc):
+        return "Lithuania"
+
+    if re.search(r'\b(?:remote|nuotolinis|nuotoliu)\b', loc):
+        return "Remote"
+
+    return loc.capitalize()
 
 
 def extract_experience_rules(text: str) -> Tuple[int, bool]:
@@ -332,9 +424,10 @@ def normalize_job(raw: RawJobListing) -> NormalizedJob:
     
     # Clean location
     norm_loc = normalize_location(raw.location_raw)
+    norm_comp = normalize_company(raw.company)
     
     # Generate deterministic Job ID
-    id_source = f"{raw.company.strip().lower()}|{norm_title}|{norm_loc.lower()}"
+    id_source = f"{norm_comp}|{norm_title}|{norm_loc.lower()}"
     job_id = hashlib.sha256(id_source.encode('utf-8')).hexdigest()[:12]
     
     # Generate initial factual evidence items
