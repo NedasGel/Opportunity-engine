@@ -211,6 +211,120 @@ class TestJobEvaluation(unittest.TestCase):
         self.assertNotIn("AI", norm.technical_keywords)
         self.assertEqual(result.score_breakdown.ai_relevance, 0.0)
 
+    def test_reject_mid_role_mandating_production_deployment_at_scale(self):
+        # Accenture: AI/ML Computational Scientist requiring proven production experience at scale
+        raw = RawJobListing(
+            raw_id="accenture-comp-sci",
+            title="AI/ML Computational Scientist",
+            company="Accenture Baltics",
+            location_raw="Vilnius, Lithuania",
+            description_raw=(
+                "Join Accenture as an AI/ML Computational Scientist. "
+                "Requirements: Proven experience as a machine learning engineer or scientist, deploying models in production at scale. "
+                "Knowledge of distributed computing systems and architecture, Python, PyTorch."
+            ),
+            job_url="https://accenture.example.com/jobs/ai-scientist",
+            source="test"
+        )
+        norm = normalize_job(raw)
+        result = evaluate_job(norm, self.profile)
+
+        self.assertEqual(result.recommendation, Recommendation.REJECT)
+        self.assertLessEqual(result.total_score, 35.0)
+        self.assertTrue(any("commercial production experience" in b for b in result.hard_blockers))
+
+    def test_fullstack_ai_role_not_recommended_as_apply(self):
+        # Purai tech: Full-Stack Developer (AI) requiring shipped production apps
+        raw = RawJobListing(
+            raw_id="purai-fullstack-ai",
+            title="Full-Stack Developer (AI)",
+            company="Purai tech, MB",
+            location_raw="Vilnius (Hybrid)",
+            description_raw=(
+                "We are looking for a Full-Stack Developer (AI) to join our team. "
+                "Requirements: shipped and maintained full stack applications in production, "
+                "strong in TypeScript, React/Next.js, backend Node.js/Python, database schemas Postgres, "
+                "live deployment & debugging. Experience with AI tools and LLM APIs is a plus."
+            ),
+            job_url="https://purai.example.com/jobs/fullstack-ai",
+            source="test"
+        )
+        norm = normalize_job(raw)
+        result = evaluate_job(norm, self.profile)
+
+        # Must NOT be APPLY; blocked by mandatory production shipping requirement
+        self.assertEqual(result.recommendation, Recommendation.REJECT)
+        self.assertLessEqual(result.total_score, 35.0)
+        self.assertLess(result.score_breakdown.ai_relevance, 26.0)
+        self.assertTrue(any("commercial production experience" in b for b in result.hard_blockers))
+
+    def test_fullstack_web_ai_without_production_mandate_not_apply(self):
+        # A fullstack web developer role with AI wrapper tools but no deep AI work must not pass APPLY gate
+        raw = RawJobListing(
+            raw_id="web-ai-tools",
+            title="Full-Stack Developer (AI Tools)",
+            company="WebSaaS",
+            location_raw="Vilnius (Hybrid)",
+            description_raw=(
+                "We are looking for a Full-Stack Developer to work on our web app. "
+                "Stack: React, Next.js, Node.js, PostgreSQL. You will integrate OpenAI APIs into our web dashboard. "
+                "Knowledge of TypeScript and web APIs required."
+            ),
+            job_url="https://websaas.example.com/jobs/1",
+            source="test"
+        )
+        norm = normalize_job(raw)
+        result = evaluate_job(norm, self.profile)
+
+        # Must not pass APPLY gate (ai_relevance must be below 26.0)
+        self.assertNotEqual(result.recommendation, Recommendation.APPLY)
+        self.assertLess(result.score_breakdown.ai_relevance, 26.0)
+
+    def test_junior_nlp_engineer_neuro_technology_remains_apply(self):
+        # Junior NLP role at Neuro Technology must remain strong APPLY
+        raw = RawJobListing(
+            raw_id="neuro-junior-nlp",
+            title="Junior NLP Engineer",
+            company="Neuro Technology",
+            location_raw="Vilnius",
+            description_raw=(
+                "Neuro Technology is seeking a Junior NLP Engineer. "
+                "Work on Natural Language Processing models, transformers, and text processing pipelines using Python and PyTorch. "
+                "Open to university students and recent graduates, strong foundations in machine learning."
+            ),
+            job_url="https://neurotechnology.example.com/jobs/nlp-junior",
+            source="test"
+        )
+        norm = normalize_job(raw)
+        result = evaluate_job(norm, self.profile)
+
+        self.assertEqual(result.recommendation, Recommendation.APPLY)
+        self.assertEqual(len(result.hard_blockers), 0)
+        self.assertGreaterEqual(result.total_score, 80.0)
+        self.assertEqual(result.score_breakdown.ai_relevance, 40.0)
+
+    def test_simple_deployment_mention_not_blocked(self):
+        # A junior role where candidates learn deployment or mention deploying without commercial mandate must not be blocked
+        raw = RawJobListing(
+            raw_id="jr-ml-learning-deploy",
+            title="Junior Machine Learning Developer",
+            company="SmartAI",
+            location_raw="Vilnius (Hybrid)",
+            description_raw=(
+                "Junior ML Developer. Build ML models with Python and PyTorch. "
+                "You will learn how to deploy models to production. "
+                "Open to university students."
+            ),
+            job_url="https://smartai.example.com/jobs/jr-ml",
+            source="test"
+        )
+        norm = normalize_job(raw)
+        result = evaluate_job(norm, self.profile)
+
+        self.assertEqual(result.recommendation, Recommendation.APPLY)
+        self.assertFalse(any("commercial production experience" in b for b in result.hard_blockers))
+
 
 if __name__ == "__main__":
     unittest.main()
+

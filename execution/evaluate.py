@@ -116,6 +116,29 @@ VADOVAS_SENIOR_PATTERNS = [
     r'\bhead\b', r'\bchief\b'
 ]
 
+WEB_FULLSTACK_TITLE_PATTERNS = [
+    r'\bfull[\-\s]?stack\b', r'\bfrontend\b', r'\bfront[\-\s]end\b',
+    r'\bbackend\b', r'\bback[\-\s]end\b', r'\bweb\s+developer\b',
+    r'\bweb\s+engineer\b'
+]
+
+DEEP_AI_WORK_PATTERNS = [
+    r'\b(?:train(?:ing)?|fine[\-\s]?tun(?:ing|ed)?)\b[^\.\;\n]{0,60}\b(?:models?|llms?|neural|transformers?)\b',
+    r'\b(?:rag|embeddings?|vector\s+(?:database|store|search)|retrieval[\-\s]augmented)\b',
+    r'\b(?:ai\s+agents?|agentic\s+(?:systems?|workflows?)|langchain|crewai|autogen)\b',
+    r'\b(?:deep\s+learning|machine\s+learning\s+models?|nlp|computer\s+vision|pytorch|tensorflow|scikit[\-\s]?learn)\b',
+    r'\b(?:prompt\s+engineering|llm\s+pipelines?|synthetic\s+data|model\s+evaluation)\b',
+    r'\b(?:reinforcement\s+learning|neural\s+networks?|transformer\s+models?)\b'
+]
+
+MANDATORY_PRODUCTION_EXPERIENCE_PATTERNS = [
+    r'\b(?:proven\s+experience|commercial\s+experience|proven\s+track\s+record|substantial\s+experience|extensive\s+experience)\b[^\.\;\n]{0,80}\b(?:deploying|deployed|shipping|shipped|maintaining|scale|production)\b',
+    r'\b(?:in\s+production\s+at\s+scale|production\s+systems\s+at\s+scale|models\s+in\s+production\s+at\s+scale)\b',
+    r'\b(?:shipped\s+and\s+maintained|maintain(?:ing|ed)?\s+production\s+systems|maintaining\s+production\s+applications)\b',
+    r'\bshipped\s+(?:and\s+maintained\s+)?[a-z\s\-]*applications\s+in\s+production\b',
+    r'\b(?:several|substantial|prior)\s+years?(?:\s+of)?\s+experience\s+in\s+production\b',
+]
+
 CANDIDATE_SKILL_GROUPS = {
     "python": [r'\bpython\b', r'\bpy\b'],
     "c_cpp": [r'\bc\+\+\b', r'\bcpp\b', r'\bc\s+and\s+c\+\+\b'],
@@ -208,7 +231,22 @@ def evaluate_job(job: NormalizedJob, profile: CandidateProfile) -> EvaluationRes
         concerns.append("IT support / helpdesk role with limited development or AI relevance.")
     elif _matches_any(CORE_AI_PATTERNS, title_lower):
         # Direct AI/ML in title
-        if has_tech_desc or is_junior:
+        if _matches_any(WEB_FULLSTACK_TITLE_PATTERNS, title_lower):
+            # Title is primarily Web / Full-Stack Development with an AI keyword
+            deep_ai_count = sum(1 for p in DEEP_AI_WORK_PATTERNS if re.search(p, text_lower))
+            if deep_ai_count >= 2:
+                # Genuinely building ML/LLM/AI systems while also doing web development
+                ai_relevance_pts = 28.0 if is_junior else 26.0
+                strong_matches.append("Full-stack / web role with substantial AI/ML systems engineering responsibilities.")
+            elif deep_ai_count == 1:
+                # Moderate AI components alongside web stack
+                ai_relevance_pts = 22.0 if is_junior else 20.0
+                weak_matches.append("Web/full-stack role with some AI/ML components.")
+            else:
+                # Primarily React/Next.js/Node/Postgres with superficial AI API integration
+                ai_relevance_pts = 18.0 if is_junior else 16.0
+                concerns.append("Primarily web/full-stack development (React/Node/Postgres) with AI API integration rather than core AI/ML systems engineering.")
+        elif has_tech_desc or is_junior:
             ai_relevance_pts = 40.0 if is_junior else 36.0
             strong_matches.append("Primary career direction: Direct AI/ML/GenAI engineering focus.")
         else:
@@ -320,7 +358,18 @@ def evaluate_job(job: NormalizedJob, profile: CandidateProfile) -> EvaluationRes
             statement="Listing mandates a completed higher education degree."
         ))
 
-    if hard_blockers and (is_senior or (job.experience_is_mandatory and job.min_years_experience >= 2) or job.degree_is_mandatory or is_non_tech):
+    # Mandatory commercial production deployment / scaling experience check
+    has_mandatory_prod_exp = _matches_any(MANDATORY_PRODUCTION_EXPERIENCE_PATTERNS, text_lower)
+    if has_mandatory_prod_exp and not is_student_friendly:
+        hard_blockers.append(
+            "Requires mandatory commercial production experience / deployment at scale beyond student background."
+        )
+        evidence_items.append(EvidenceItem(
+            fact_type=FactType.FACT,
+            statement="Listing requires proven commercial production deployment or maintaining production systems at scale."
+        ))
+
+    if hard_blockers and (is_senior or (job.experience_is_mandatory and job.min_years_experience >= 2) or job.degree_is_mandatory or is_non_tech or has_mandatory_prod_exp):
         exp_pts = 0.0
     elif is_student_friendly:
         exp_pts = 20.0
