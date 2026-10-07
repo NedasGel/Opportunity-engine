@@ -1,14 +1,33 @@
 import json
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Set
 from .models import EvaluationResult, Recommendation
+from .prefilter import PrefilteredJob
 
 
-def format_markdown_report(evaluations: List[EvaluationResult]) -> str:
-    """Formats evaluated job opportunities into a clean, human-readable Markdown report."""
+def format_markdown_report(
+    evaluations: List[EvaluationResult],
+    new_job_ids: Optional[Set[str]] = None,
+    prefiltered: Optional[List[PrefilteredJob]] = None,
+    run_stats: Optional[Dict[str, int]] = None,
+) -> str:
+    """Formats evaluated job opportunities into a clean, human-readable Markdown report.
+
+    Optional arguments (all default to None = legacy output):
+      new_job_ids: job_ids first seen in this run; tagged with [NEW].
+      prefiltered: jobs dropped by the pre-filter; listed in a collapsed audit section.
+      run_stats:   pipeline counters rendered as a summary line.
+    """
     lines = []
     lines.append("# Personal Job Opportunity Discovery Report")
     lines.append("")
     lines.append(f"**Total Opportunities Evaluated**: {len(evaluations)}")
+    if run_stats:
+        lines.append("")
+        lines.append(
+            f"**Run Summary**: Discovered {run_stats.get('discovered', 0)} unique | "
+            f"New {run_stats.get('new', 0)} | Evaluated {run_stats.get('evaluated', 0)} | "
+            f"From cache {run_stats.get('cached', 0)} | Pre-filtered {run_stats.get('prefiltered', 0)}"
+        )
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -16,7 +35,8 @@ def format_markdown_report(evaluations: List[EvaluationResult]) -> str:
     for idx, ev in enumerate(evaluations, 1):
         job = ev.normalized_job
         sb = ev.score_breakdown
-        lines.append(f"## {idx}. {job.title} — {job.company}")
+        new_tag = "[NEW] " if new_job_ids is not None and ev.job_id in new_job_ids else ""
+        lines.append(f"## {idx}. {new_tag}{job.title} — {job.company}")
         lines.append("")
         lines.append(f"- **Company**: {job.company}")
         lines.append(f"- **Location**: {job.location}")
@@ -76,16 +96,41 @@ def format_markdown_report(evaluations: List[EvaluationResult]) -> str:
         lines.append("---")
         lines.append("")
 
+    if prefiltered:
+        lines.append(f"## Pre-filtered Listings ({len(prefiltered)})")
+        lines.append("")
+        lines.append("<details>")
+        lines.append("<summary>Non-technical listings dropped before evaluation (click to expand)</summary>")
+        lines.append("")
+        lines.append("| Title | Company | Reason | Source |")
+        lines.append("|---|---|---|---|")
+        for pf in sorted(prefiltered, key=lambda p: (p.job.company.lower(), p.job.title.lower())):
+            origin = "cached" if pf.from_cache else "this run"
+            title = pf.job.title.replace("|", "/")
+            company = pf.job.company.replace("|", "/")
+            reason = pf.reason.replace("|", "/").replace("\\b", "")
+            lines.append(f"| [{title}]({pf.job.job_url}) | {company} | `{reason}` | {origin} |")
+        lines.append("")
+        lines.append("</details>")
+        lines.append("")
+
     return "\n".join(lines)
 
 
-def format_json_report(evaluations: List[EvaluationResult]) -> str:
+def format_json_report(
+    evaluations: List[EvaluationResult],
+    new_job_ids: Optional[Set[str]] = None,
+) -> str:
     """Formats evaluated job opportunities into a structured JSON string."""
     data = []
     for ev in evaluations:
         job = ev.normalized_job
         sb = ev.score_breakdown
-        data.append({
+        entry: Dict[str, Any] = {}
+        if new_job_ids is not None:
+            entry["is_new"] = ev.job_id in new_job_ids
+        data.append(entry)
+        entry.update({
             "job_id": ev.job_id,
             "title": job.title,
             "company": job.company,

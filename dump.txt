@@ -1,0 +1,21 @@
+Total rejected jobs: 20
+Šviesolaidinio kabelio suvirintojas (-a) | UAB „Personalo valdymo sistemos“ | non_tech_title: \bsuvirintoj
+Socialinis (-ė) darbuotojas (-a) darbui su šeimomis ir jų vaikais | Klaipėdos miesto šeimos ir vaiko gerovės centras, BĮ | non_tech_title: \bsocialin\w*\s*(?:\(-\w+\)\s*)?darbuotoj
+Psichologas (-ė) | Klaipėdos miesto šeimos ir vaiko gerovės centras, BĮ | non_tech_title: \bpsicholog
+Klaipėdos apskrities vaiko teisių apsaugos skyriaus teisininkas Klaipėdoje | Valstybės vaiko teisių apsaugos ir įvaikinimo tarnyba prie socialinės apsaugos ir darbo ministerijos | non_tech_title: \bteisinink
+Vilniaus apskrities vaiko teisių apsaugos skyriaus mobilios komandos psichologas | Valstybės vaiko teisių apsaugos ir įvaikinimo tarnyba prie socialinės apsaugos ir darbo ministerijos | non_tech_title: \bpsicholog
+MDFT (multidimensinės šeimos terapijos) specialistas Kaune | Valstybės vaiko teisių apsaugos ir įvaikinimo tarnyba prie socialinės apsaugos ir darbo ministerijos | non_tech_title: \bterapij
+MDFT (multidimensinės šeimos terapijos) specialistu Utenoje | Valstybės vaiko teisių apsaugos ir įvaikinimo tarnyba prie socialinės apsaugos ir darbo ministerijos | non_tech_title: \bterapij
+MDFT (multidimensinės šeimos terapijos) specialistas Panevėžyje | Valstybės vaiko teisių apsaugos ir įvaikinimo tarnyba prie socialinės apsaugos ir darbo ministerijos | non_tech_title: \bterapij
+MDFT (multidimensinės šeimos terapijos) koordinatorius Vilniuje | Valstybės vaiko teisių apsaugos ir įvaikinimo tarnyba prie socialinės apsaugos ir darbo ministerijos | non_tech_title: \bterapij
+MDFT (multidimensinės šeimos terapijos) koordinatorius Kaune | Valstybės vaiko teisių apsaugos ir įvaikinimo tarnyba prie socialinės apsaugos ir darbo ministerijos | non_tech_title: \bterapij
+MDFT (multidimensinės šeimos terapijos) koordinatorius Šiauliuose | Valstybės vaiko teisių apsaugos ir įvaikinimo tarnyba prie socialinės apsaugos ir darbo ministerijos | non_tech_title: \bterapij
+MDFT (multidimensinės šeimos terapijos) specialistas Panevėžyje (šeiminiai globos namai, šeimynos) | Valstybės vaiko teisių apsaugos ir įvaikinimo tarnyba prie socialinės apsaugos ir darbo ministerijos | non_tech_title: \bterapij
+MDFT (multidimensinės šeimos terapijos) koordinatorius Panevėžyje (šeiminiai globos namai, šeimynos) | Valstybės vaiko teisių apsaugos ir įvaikinimo tarnyba prie socialinės apsaugos ir darbo ministerijos | non_tech_title: \bterapij
+Pardavėjas - koloristas (-ė) | CV-Online Recruitment Lithuania | non_tech_title: \bpardavej
+Vandens filtrų montuotojas (-a) | CV-Online Recruitment Lithuania | non_tech_title: \bmontuotoj
+Vyriausiasis restorano administratorius (-ė) | CV-Online Recruitment Lithuania | non_tech_title: \brestoran
+Pardavėjas - konsultantas (-ė) | CV-Online Recruitment Lithuania | non_tech_title: \bpardavej
+Vyr. Sandėlininkas (-ė) | CV-Online Recruitment Lithuania | non_tech_title: \bsandelinink
+Sandelio darbuotojas krovejas vilnius parnasas uab | Company on CVMarket | non_tech_title: \bkrovej
+Pardavejas a kaune zaliakalnis savanoriu pr kaunas lidl lietuva uab | Company on CVMarket | non_tech_title: \bpardavej

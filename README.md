@@ -88,6 +88,8 @@ execution/
 ├── models.py
 ├── normalize.py
 ├── deduplicate.py
+├── prefilter.py
+├── state.py
 ├── evaluate.py
 ├── report.py
 ├── pipeline.py
@@ -114,7 +116,13 @@ This separation allows the AI-oriented workflow to use deterministic components 
       ↓
 [ DEDUPLICATE ]
       ↓
+[ STATE LOOKUP ]   ← SQLite: skip jobs already processed in earlier runs
+      ↓
+[ PRE-FILTER ]     ← drop obvious non-tech listings before evaluation
+      ↓
 [ EVALUATE ]
+      ↓
+[ PERSIST ]
       ↓
 [ RANK ]
       ↓
@@ -176,6 +184,39 @@ The deduplication layer attempts to identify duplicate opportunities using infor
 * available identifiers
 
 When duplicates are found, useful source information is preserved rather than simply discarded.
+
+### State lookup (SQLite)
+
+Every discovered job is tracked in a local SQLite database (`.tmp/state/opportunity_engine.db`, standard-library `sqlite3`, no ORM).
+
+| Status | Meaning |
+| --- | --- |
+| `UNSEEN` | Registered this run, not yet processed (also resumes interrupted runs) |
+| `REJECTED_PREFILTER` | Dropped by the pre-filter |
+| `EVALUATED` | Fully evaluated; the result is cached as JSON |
+
+A stored job is re-processed only when:
+
+* its content (title / company / description) changed,
+* `EVALUATOR_VERSION` (in `evaluate.py`) or `PREFILTER_VERSION` (in `prefilter.py`) was bumped, or
+* `--force-reeval` is passed.
+
+> When you change scoring or pre-filter rules, **bump the corresponding version constant** so cached results are refreshed automatically.
+
+Jobs are matched by `job_id` and, as a fallback, by any previously seen URL, so a posting whose location was resolved differently in a later run is still recognised.
+
+### Pre-filter
+
+A deterministic, **default-pass** title filter drops obvious non-technical listings (manual labour, retail, transport, hospitality, care, trades) before evaluation.
+
+* A title with **any** technical signal (`IT`, `AI`, `data`, `duomenų`, `inžinierius`, `programuotojas`, `sistemų`, `praktika`, …) is never dropped.
+* A title is dropped only if it matches an explicit blocklist (e.g. `darbininkas`, `pardavėjas`, `ekspeditorius`, `vairuotojas`).
+* A blocked title is still passed if the description contains ≥ 2 strong technical signals.
+* Lithuanian diacritics are folded, so `Pardavėjas` and `Pardavejas` match identically.
+
+Dropped listings are shown in a collapsed audit section at the end of the report, together with the matched rule.
+
+A regression test checks the filter against a frozen snapshot of 253 real listings and requires that **no** job rated APPLY / CONSIDER / LOW_PRIORITY is ever blocked.
 
 ### Evaluate
 
@@ -351,6 +392,8 @@ opportunity-engine/
 │   ├── models.py
 │   ├── normalize.py
 │   ├── deduplicate.py
+│   ├── prefilter.py
+│   ├── state.py
 │   ├── evaluate.py
 │   ├── report.py
 │   ├── pipeline.py
@@ -365,13 +408,19 @@ opportunity-engine/
 │       └── work_in_lithuania.py
 │
 ├── tests/
+│   ├── fixtures/
+│   │   └── eval_snapshot_2026_10_05.json
 │   ├── test_normalization.py
 │   ├── test_evaluation.py
 │   ├── test_deduplication.py
 │   ├── test_urls_and_safety.py
 │   ├── test_candidate_grounding.py
 │   ├── test_pipeline.py
-│   └── test_multi_sources.py
+│   ├── test_multi_sources.py
+│   ├── test_prefilter.py
+│   ├── test_prefilter_regression.py
+│   ├── test_state_store.py
+│   └── test_pipeline_state.py
 │
 ├── .env.example
 ├── .gitignore
@@ -393,11 +442,13 @@ The project includes unit and integration tests covering:
 * application-message generation
 * multi-source behavior
 * end-to-end pipeline execution
+* pre-filter safety (must-block / must-pass lists and a zero-false-negative regression on real data)
+* SQLite state management (caching, versioned re-evaluation, URL aliasing, rollback)
 
 Current test status:
 
 ```text
-33 passed
+76 passed
 0 failed
 ```
 
@@ -435,7 +486,19 @@ py -m execution.pipeline --source mock
 py -m execution.pipeline --query "Python intern" --output .tmp/
 ```
 
-Generated reports and temporary execution artifacts are written to `.tmp/`.
+### State and pre-filter options
+
+```bash
+py -m execution.pipeline --report-scope new   # only jobs evaluated in this run
+py -m execution.pipeline --force-reeval       # ignore cache, re-process everything
+py -m execution.pipeline --no-prefilter       # evaluate every job
+py -m execution.pipeline --no-state           # stateless run, DB untouched
+py -m execution.pipeline --db path/to/state.db
+```
+
+By default the report contains all known jobs seen in this run (cached + newly evaluated). Jobs first seen in this run are tagged `[NEW]`.
+
+Generated reports, the state database and temporary execution artifacts are written to `.tmp/`.
 
 ---
 
@@ -468,7 +531,6 @@ Potential future directions include:
 * evaluating a job URL supplied directly by a user
 * additional legitimate job sources
 * richer opportunity research
-* persistent opportunity state
 * application tracking
 * human approval workflows
 * additional research-oriented directives

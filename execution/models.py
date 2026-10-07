@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import List, Optional, Dict, Any
 
@@ -133,3 +133,47 @@ class EvaluationResult:
     concerns: List[str] = field(default_factory=list)
     evidence_items: List[EvidenceItem] = field(default_factory=list)
     application_message_draft: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Serialization helpers (used by the SQLite state store for result caching).
+# Round-trip is lossless: evaluation_from_dict(evaluation_to_dict(r)) == r
+# ---------------------------------------------------------------------------
+
+def _enum_safe(obj: Any) -> Any:
+    if isinstance(obj, Enum):
+        return obj.value
+    if isinstance(obj, dict):
+        return {k: _enum_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_enum_safe(v) for v in obj]
+    return obj
+
+
+def evaluation_to_dict(result: EvaluationResult) -> Dict[str, Any]:
+    return _enum_safe(asdict(result))
+
+
+def _evidence_from_dict(d: Dict[str, Any]) -> EvidenceItem:
+    return EvidenceItem(
+        fact_type=FactType(d["fact_type"]),
+        statement=d["statement"],
+        source_reference=d.get("source_reference"),
+    )
+
+
+def normalized_job_from_dict(d: Dict[str, Any]) -> NormalizedJob:
+    data = dict(d)
+    data["work_mode"] = WorkMode(data["work_mode"])
+    data["employment_type"] = EmploymentType(data["employment_type"])
+    data["evidence"] = [_evidence_from_dict(e) for e in data.get("evidence", [])]
+    return NormalizedJob(**data)
+
+
+def evaluation_from_dict(d: Dict[str, Any]) -> EvaluationResult:
+    data = dict(d)
+    data["normalized_job"] = normalized_job_from_dict(data["normalized_job"])
+    data["score_breakdown"] = ScoreBreakdown(**data["score_breakdown"])
+    data["recommendation"] = Recommendation(data["recommendation"])
+    data["evidence_items"] = [_evidence_from_dict(e) for e in data.get("evidence_items", [])]
+    return EvaluationResult(**data)

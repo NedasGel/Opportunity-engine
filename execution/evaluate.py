@@ -5,6 +5,10 @@ from .models import (
     Recommendation, WorkMode, EmploymentType, EvidenceItem, FactType
 )
 
+# Bump whenever scoring rules/thresholds change. The state store re-evaluates
+# any cached result whose stored evaluator_version differs from this value.
+EVALUATOR_VERSION = "1"
+
 
 LITHUANIAN_CITIES = [
     "vilnius", "vilniuje", "vilniaus",
