@@ -9,13 +9,51 @@ from ..models import RawJobListing
 
 
 def extract_linkedin_description_html(html: str) -> Optional[str]:
-    """Extracts job description from LinkedIn guest jobPosting HTML."""
-    desc_m = re.search(r'<div class="show-more-less-html__markup[^"]*">([\s\S]*?)</div>', html)
-    if desc_m:
-        raw_text = unescape(re.sub(r'<[^>]+>', ' ', desc_m.group(1))).strip()
-        cleaned = re.sub(r'\s+', ' ', raw_text)
-        return cleaned if cleaned else None
-    return None
+    """Extracts job description from LinkedIn guest jobPosting HTML robustly."""
+    start_marker = 'class="show-more-less-html__markup'
+    idx = html.find(start_marker)
+    
+    cleaned = ""
+    if idx != -1:
+        tag_end = html.find('>', idx)
+        if tag_end != -1:
+            start_pos = tag_end + 1
+            # The description block typically ends just before the "Show more" button
+            end_marker = 'show-more-less-html__button'
+            end_idx = html.find(end_marker, start_pos)
+            
+            if end_idx != -1:
+                # Find the closing </div> of the markup container before the button
+                close_div = html.rfind('</div>', start_pos, end_idx)
+                if close_div != -1:
+                    raw_text = html[start_pos:close_div]
+                else:
+                    raw_text = html[start_pos:end_idx]
+            else:
+                # Fallback to greedy regex if button isn't found
+                fallback_m = re.search(r'<div class="show-more-less-html__markup[^>]*>([\s\S]*?)<!---->\s*</section>', html)
+                if fallback_m:
+                    raw_text = fallback_m.group(1)
+                else:
+                    # Final fallback to standard regex (prone to nested <div> truncation)
+                    fallback_m2 = re.search(r'<div class="show-more-less-html__markup[^>]*>([\s\S]*?)</div>', html)
+                    raw_text = fallback_m2.group(1) if fallback_m2 else ""
+            
+            if raw_text:
+                raw_text = unescape(re.sub(r'<[^>]+>', ' ', raw_text)).strip()
+                cleaned = re.sub(r'\s+', ' ', raw_text)
+                
+    # Also extract criteria (Seniority, Employment type, etc.)
+    criteria_m = re.search(r'<ul class="description__job-criteria-list[^"]*">([\s\S]*?)</ul>', html)
+    if criteria_m:
+        criteria_text = unescape(re.sub(r'<[^>]+>', ' ', criteria_m.group(1))).strip()
+        criteria_cleaned = re.sub(r'\s+', ' ', criteria_text)
+        if cleaned:
+            cleaned += " | " + criteria_cleaned
+        else:
+            cleaned = criteria_cleaned
+            
+    return cleaned if cleaned else None
 
 
 def fetch_linkedin_detail_description(job_url: str, headers: dict, timeout: int = 8) -> Optional[str]:

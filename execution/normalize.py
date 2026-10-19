@@ -197,7 +197,9 @@ def detect_employment_type(text: str, title: str) -> EmploymentType:
         r'\bfull[\-\s]time\b',
         r'\bpilnas\s+etatas\b',
         r'\bvisas\s+etatas\b',
-        r'\b1\.0\s+etatas\b'
+        r'\b1\.0\s+etatas\b',
+        r'\b40\s+hours\b',
+        r'\b40\s+val\b'
     ]
     if _matches_any_pattern(title_lower, full_time_title_patterns):
         return EmploymentType.FULL_TIME
@@ -259,7 +261,10 @@ def extract_education_rules(text: str) -> Tuple[Optional[str], bool, bool]:
         r"aukštasis\s+(?:universitetinis\s+)?išsilavinimas\s*\((?:baigtas|būtinas)\)",
         r"turėti\s+(?:aukštąjį|bakalauro|magistro)",
         r"bachelor'?s\s+degree\s+required",
-        r"privaloma\s*:\s*aukštasis"
+        r"privaloma\s*:\s*aukštasis",
+        r"bachelor'?s\s+(?:degree\s+)?in\s+(?:computer\s+science|engineering|it|stem)",
+        r"bachelor'?s\s+or\s+master'?s",
+        r"(?:bsc|msc|b\.s\.|m\.s\.)\s+in\s+computer"
     ]
     for pat in mandatory_degree_patterns:
         if re.search(pat, lower):
@@ -402,6 +407,17 @@ def extract_technical_keywords(text: str) -> List[str]:
     return found
 
 
+def extract_salary(text: str) -> Optional[str]:
+    """Extracts salary ranges like '€1,710 to €4,700 gross per month' from text."""
+    # Pattern to match €X to €Y or EUR X - Y
+    pattern = r'(?:€|eur|euro)\s*[\d,.\s]+(?:-|to|iki|–|—)\s*(?:€|eur|euro)?\s*[\d,.\s]+(?:\s*gross\s*per\s*month|\s*bruto)?'
+    match = re.search(pattern, text, re.IGNORECASE)
+    if match:
+        # Clean up excessive spaces
+        return re.sub(r'\s+', ' ', match.group(0)).strip()
+    return None
+
+
 def normalize_job(raw: RawJobListing) -> NormalizedJob:
     """Deterministically normalizes a RawJobListing into a standard NormalizedJob."""
     norm_title = normalize_title(raw.title)
@@ -417,6 +433,9 @@ def normalize_job(raw: RawJobListing) -> NormalizedJob:
     # Languages and Tech
     langs = extract_languages(raw.description_raw)
     tech = extract_technical_keywords(f"{raw.title} {raw.description_raw}")
+    
+    # Salary
+    salary = raw.salary_raw.strip() if raw.salary_raw else extract_salary(raw.description_raw)
     
     # Clean URLs
     clean_job_url = clean_url(raw.job_url) or raw.job_url
@@ -463,7 +482,7 @@ def normalize_job(raw: RawJobListing) -> NormalizedJob:
         location=norm_loc,
         work_mode=work_mode,
         employment_type=emp_type,
-        salary=raw.salary_raw.strip() if raw.salary_raw else None,
+        salary=salary,
         description=raw.description_raw.strip(),
         education_requirements=edu_desc,
         requires_completed_degree=req_degree,

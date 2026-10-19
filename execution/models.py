@@ -94,6 +94,10 @@ class NormalizedJob:
     degree_is_mandatory: bool = False
     min_years_experience: int = 0
     experience_is_mandatory: bool = False
+    # Populated by execution.agentic_extractor (None = not extracted / unstated)
+    required_experience_years: Optional[int] = None
+    is_strictly_full_time: Optional[bool] = None
+    extraction_method: str = "regex"
     language_requirements: List[str] = field(default_factory=list)
     technical_keywords: List[str] = field(default_factory=list)
     posted_date: Optional[str] = None

@@ -7,7 +7,7 @@ from .models import (
 
 # Bump whenever scoring rules/thresholds change. The state store re-evaluates
 # any cached result whose stored evaluator_version differs from this value.
-EVALUATOR_VERSION = "1"
+EVALUATOR_VERSION = "2"
 
 
 LITHUANIAN_CITIES = [
@@ -347,11 +347,19 @@ def evaluate_job(job: NormalizedJob, profile: CandidateProfile) -> EvaluationRes
             statement=f"Role title '{job.title}' specifies Senior/Lead seniority level."
         ))
 
-    if job.experience_is_mandatory and job.min_years_experience >= 2:
-        hard_blockers.append(f"Requires {job.min_years_experience}+ years mandatory professional experience.")
+    # Required years: semantic (LLM) extraction is authoritative; regex values are the fallback.
+    if job.extraction_method == "llm":
+        required_years = job.required_experience_years
+    else:
+        required_years = job.min_years_experience if job.experience_is_mandatory else None
+    # 2nd-year student with 0 professional years: anything above 1 required year is a hard blocker.
+    has_experience_blocker = required_years is not None and required_years > 1
+    if has_experience_blocker:
+        hard_blockers.append(f"Requires {required_years}+ years mandatory professional experience.")
         evidence_items.append(EvidenceItem(
             fact_type=FactType.FACT,
-            statement=f"Job mandates {job.min_years_experience} years of prior professional experience."
+            statement=f"Job mandates {required_years} years of prior professional experience "
+                      f"(detected via {job.extraction_method} extraction)."
         ))
 
     # Mandatory completed degree check
@@ -373,7 +381,7 @@ def evaluate_job(job: NormalizedJob, profile: CandidateProfile) -> EvaluationRes
             statement="Listing requires proven commercial production deployment or maintaining production systems at scale."
         ))
 
-    if hard_blockers and (is_senior or (job.experience_is_mandatory and job.min_years_experience >= 2) or job.degree_is_mandatory or is_non_tech or has_mandatory_prod_exp):
+    if hard_blockers and (is_senior or has_experience_blocker or job.degree_is_mandatory or is_non_tech or has_mandatory_prod_exp):
         exp_pts = 0.0
     elif is_student_friendly:
         exp_pts = 20.0
@@ -410,6 +418,12 @@ def evaluate_job(job: NormalizedJob, profile: CandidateProfile) -> EvaluationRes
     # ---------------------------------------------------------
     sched_pts = 0.0
 
+    if job.is_strictly_full_time is not None:
+        # Semantic extraction distinguishes "full-time only" from "full-time or part-time".
+        is_explicitly_full_time = job.is_strictly_full_time
+    else:
+        is_explicitly_full_time = job.employment_type == EmploymentType.FULL_TIME or any(k in text_lower for k in ["full-time", "full time", "40 hours", "40 val", "pilnas etatas", "visas etatas", "1.0 etatas"])
+
     if job.employment_type == EmploymentType.PART_TIME or "part-time" in text_lower or "dalinis" in text_lower:
         sched_pts = 10.0
         strong_matches.append("Part-time schedule highly compatible with university studies.")
@@ -419,13 +433,13 @@ def evaluate_job(job: NormalizedJob, profile: CandidateProfile) -> EvaluationRes
     elif job.employment_type == EmploymentType.INTERNSHIP or any(k in title_lower for k in ["intern", "praktik", "trainee"]):
         sched_pts = 9.0
         strong_matches.append("Internship schedule structured for students.")
+    elif is_explicitly_full_time:
+        sched_pts = 3.0
+        soft_penalties.append("Full-time / 40-hour schedule (requires managing university schedule).")
+        concerns.append("Full-time schedule may conflict with mandatory university classes.")
     elif job.employment_type == EmploymentType.ENTRY_LEVEL or "junior" in title_lower:
         sched_pts = 5.0
         missing_info.append("Flexibility for university lectures not explicitly stated.")
-    elif job.employment_type == EmploymentType.FULL_TIME:
-        sched_pts = 3.0
-        soft_penalties.append("Full-time position (requires managing university schedule).")
-        concerns.append("Full-time schedule may conflict with mandatory university classes.")
     else:
         sched_pts = 5.0
         missing_info.append("Exact employment schedule type not fully defined.")

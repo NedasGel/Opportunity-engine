@@ -6,10 +6,11 @@ from .models import (
 )
 from .normalize import normalize_job
 from .deduplicate import deduplicate_jobs
-from .evaluate import evaluate_job
+from .evaluate import evaluate_job, EVALUATOR_VERSION
 from .prefilter import prefilter_job, PrefilteredJob
 from .state import JobStateStore, JobRecord, DEFAULT_DB_PATH, STATUS_EVALUATED, STATUS_REJECTED_PREFILTER
 from .report import format_markdown_report, format_json_report
+from .agentic_extractor import AgenticExtractor, apply_extraction, DEFAULT_MODEL as DEFAULT_EXTRACTION_MODEL
 from .sources.base import JobSource
 from .sources.mock_source import MockJobSource
 from .sources.cvbankas import CVBankasSource
@@ -39,9 +40,10 @@ DEFAULT_DISCOVERY_QUERIES = [
 class JobDiscoveryPipeline:
     """
     Deterministic Multi-Source Job Discovery Pipeline orchestrating:
-    DISCOVER -> NORMALIZE -> DEDUPLICATE -> STATE LOOKUP -> PRE-FILTER -> EVALUATE -> PERSIST -> RANK -> REPORT
+    DISCOVER -> NORMALIZE -> DEDUPLICATE -> STATE LOOKUP -> PRE-FILTER -> EXTRACT (LLM) -> EVALUATE -> PERSIST -> RANK -> REPORT
 
     state_store=None runs statelessly (every job is pre-filtered/evaluated each run).
+    extractor=None skips semantic extraction and keeps the regex-derived requirements.
     """
 
     def __init__(
@@ -52,6 +54,7 @@ class JobDiscoveryPipeline:
         enable_prefilter: bool = True,
         force_reeval: bool = False,
         report_scope: str = "all",
+        extractor: Optional[AgenticExtractor] = None,
     ):
         self.sources = sources if sources is not None else [
             CVBankasSource(),
@@ -67,8 +70,10 @@ class JobDiscoveryPipeline:
         if report_scope not in ("all", "new"):
             raise ValueError("report_scope must be 'all' or 'new'")
         self.report_scope = report_scope
+        self.extractor = extractor if (extractor and extractor.available) else None
         self.last_run_stats: Dict[str, int] = {}
         self.last_prefiltered: List[PrefilteredJob] = []
+        self.last_extraction_stats: Dict[str, int] = {}
 
     def run(
         self,
@@ -150,7 +155,25 @@ class JobDiscoveryPipeline:
                     continue
             to_evaluate.append((job, key))
 
-        # 6. EVALUATE (only what survived state + pre-filter)
+        # 6. EXTRACT: semantic (LLM) requirement extraction overrides regex heuristics.
+        #    Jobs whose extraction fails keep regex values and are tagged with the base
+        #    evaluator version so they are retried on the next run.
+        if self.extractor and to_evaluate:
+            before = dict(self.extractor.stats)
+            extractions = self.extractor.extract_many([(job.title, job.description) for job, _ in to_evaluate])
+            for (job, _), extraction in zip(to_evaluate, extractions):
+                if extraction is not None:
+                    apply_extraction(job, extraction)
+            self.last_extraction_stats = {
+                k: self.extractor.stats[k] - before.get(k, 0) for k in self.extractor.stats
+            }
+            if self.last_extraction_stats.get("failed"):
+                print(
+                    f"[Pipeline] Semantic extraction failed for {self.last_extraction_stats['failed']} job(s); "
+                    f"regex fallback used. Last error: {self.extractor.last_errors[-1] if self.extractor.last_errors else 'n/a'}"
+                )
+
+        # 7. EVALUATE (only what survived state + pre-filter)
         new_results: List[EvaluationResult] = []
         result_keys: List[str] = []
         for job, key in to_evaluate:
@@ -165,19 +188,22 @@ class JobDiscoveryPipeline:
             "prefiltered": len(prefiltered),
         }
 
-        # 7. PERSIST (single atomic transaction)
+        # 8. PERSIST (single atomic transaction)
         if self.state:
             with self.state.transaction():
                 for job, reason, key in newly_prefiltered:
                     self.state.mark_prefiltered(job, reason, key)
                 for result, key in zip(new_results, result_keys):
-                    self.state.mark_evaluated(result, key)
+                    fallback = self.extractor and result.normalized_job.extraction_method != "llm"
+                    self.state.mark_evaluated(
+                        result, key, evaluator_version=EVALUATOR_VERSION if fallback else None
+                    )
             self.state.finish_run(run_id, stats)
 
         self.last_run_stats = stats
         self.last_prefiltered = prefiltered
 
-        # 8. RANK
+        # 9. RANK
         evaluations: List[EvaluationResult] = (
             new_results if self.report_scope == "new" else new_results + cached_results
         )
@@ -191,7 +217,7 @@ class JobDiscoveryPipeline:
             key=lambda ev: (rec_priority[ev.recommendation], -ev.total_score)
         )
 
-        # 9. REPORT
+        # 10. REPORT
         report_new_ids = new_job_ids if self.state else None
         md_report = format_markdown_report(
             evaluations,
@@ -242,6 +268,11 @@ def main():
         choices=["all", "new"],
         help="'all' = cached + newly evaluated jobs; 'new' = only jobs evaluated this run"
     )
+    parser.add_argument("--no-llm", action="store_true", help="Disable LLM semantic requirement extraction (regex only)")
+    parser.add_argument(
+        "--extraction-model", type=str, default=DEFAULT_EXTRACTION_MODEL,
+        help="Gemini model for semantic requirement extraction"
+    )
 
     args = parser.parse_args()
 
@@ -267,7 +298,16 @@ def main():
             WorkInLithuaniaSource()
         ]
 
-    state_store = None if args.no_state else JobStateStore(args.db)
+    extractor: Optional[AgenticExtractor] = None
+    if not args.no_llm:
+        extractor = AgenticExtractor(model=args.extraction_model)
+        if not extractor.available:
+            print(f"[Pipeline] LLM extraction unavailable ({extractor.disabled_reason}); using regex fallback.")
+            extractor.close()
+            extractor = None
+
+    suffix = f"+{extractor.version_tag}" if extractor else ""
+    state_store = None if args.no_state else JobStateStore(args.db, evaluator_version_suffix=suffix)
     try:
         pipeline = JobDiscoveryPipeline(
             sources=sources,
@@ -275,6 +315,7 @@ def main():
             enable_prefilter=not args.no_prefilter,
             force_reeval=args.force_reeval,
             report_scope=args.report_scope,
+            extractor=extractor,
         )
         evaluations, md_report, _ = pipeline.run(
             query=args.query,
@@ -285,6 +326,8 @@ def main():
     finally:
         if state_store:
             state_store.close()
+        if extractor:
+            extractor.close()
 
     stats = pipeline.last_run_stats
     print("\n" + "="*70)
@@ -301,6 +344,14 @@ def main():
     low_count = sum(1 for e in evaluations if e.recommendation == Recommendation.LOW_PRIORITY)
     reject_count = sum(1 for e in evaluations if e.recommendation == Recommendation.REJECT)
     print(f"Recommendation breakdown: APPLY ({apply_count}), CONSIDER ({consider_count}), LOW_PRIORITY ({low_count}), REJECT ({reject_count})")
+    if extractor:
+        ex = pipeline.last_extraction_stats
+        print(
+            f"Semantic extraction ({extractor.model}): LLM {ex.get('llm', 0)} | "
+            f"cache {ex.get('cache', 0)} | failed->regex {ex.get('failed', 0)}"
+        )
+    else:
+        print("Semantic extraction: disabled (regex fallback)")
     if state_store:
         print(f"State DB ({args.db}): {db_counts}")
     print()

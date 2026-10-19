@@ -111,8 +111,10 @@ class JobRecord:
 class JobStateStore:
     """SQLite-backed job state tracker. Use ':memory:' for tests."""
 
-    def __init__(self, db_path: str = DEFAULT_DB_PATH):
+    def __init__(self, db_path: str = DEFAULT_DB_PATH, evaluator_version_suffix: str = ""):
         self.db_path = db_path
+        # e.g. "+llm:gemini-3.5-flash-lite:p1" -> cache entries are tied to the extractor in use
+        self.evaluator_version_suffix = evaluator_version_suffix
         if db_path != ":memory:":
             parent = os.path.dirname(os.path.abspath(db_path))
             os.makedirs(parent, exist_ok=True)
@@ -143,6 +145,10 @@ class JobStateStore:
         """Atomic block: commits on success, rolls back on any exception."""
         with self.conn:
             yield
+
+    @property
+    def evaluator_version(self) -> str:
+        return f"{EVALUATOR_VERSION}{self.evaluator_version_suffix}"
 
     # ---------------------------------------------------------------- lookups
     def _row_to_record(self, row: sqlite3.Row) -> JobRecord:
@@ -195,7 +201,7 @@ class JobStateStore:
         if record.status == STATUS_REJECTED_PREFILTER:
             return (not prefilter_enabled) or record.prefilter_version != PREFILTER_VERSION
         if record.status == STATUS_EVALUATED:
-            return record.evaluator_version != EVALUATOR_VERSION or not record.evaluation_json
+            return record.evaluator_version != self.evaluator_version or not record.evaluation_json
         return True
 
     def load_cached_result(self, record: JobRecord) -> EvaluationResult:
@@ -248,9 +254,13 @@ class JobStateStore:
         )
         self._add_urls(job, key)
 
-    def mark_evaluated(self, result: EvaluationResult, key: Optional[str] = None) -> None:
+    def mark_evaluated(
+        self, result: EvaluationResult, key: Optional[str] = None, evaluator_version: Optional[str] = None
+    ) -> None:
+        """evaluator_version overrides the store default (used to tag regex-fallback results)."""
         job = result.normalized_job
         key = key or job.job_id
+        version = evaluator_version or self.evaluator_version
         self._ensure_row(job, key)
         self.conn.execute(
             """
@@ -261,7 +271,7 @@ class JobStateStore:
             WHERE job_id = ?
             """,
             (STATUS_EVALUATED, job.title, job.company, job.location, job.source,
-             job.job_url, compute_content_hash(job), PREFILTER_VERSION, EVALUATOR_VERSION,
+             job.job_url, compute_content_hash(job), PREFILTER_VERSION, version,
              result.recommendation.value, result.total_score,
              json.dumps(evaluation_to_dict(result), ensure_ascii=False), _now(), key),
         )
