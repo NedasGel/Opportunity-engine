@@ -8,6 +8,23 @@ from .base import JobSource
 from ..models import RawJobListing
 
 
+EXPIRED_HTML_MARKERS = (
+    "skelbimas neaktyvus",
+    "skelbimas nebegalioja",
+    "skelbimo galiojimo laikas baigėsi",
+    "skelbimo galiojimo laikas pasibaigė",
+    "skelbimas pašalintas",
+    "this job ad is no longer active",
+)
+
+
+def is_expired_detail_html(html: str) -> bool:
+    if not html:
+        return False
+    lowered = unescape(html).lower()
+    return any(marker in lowered for marker in EXPIRED_HTML_MARKERS)
+
+
 def extract_description_from_detail_html(html: str) -> Optional[str]:
     """
     Extracts structured job description text from CVBankas detail page HTML.
@@ -16,6 +33,7 @@ def extract_description_from_detail_html(html: str) -> Optional[str]:
     # Strip script and style tags to prevent JSON taxonomy dictionaries leaking into text
     clean_source = re.sub(r'<script[^>]*>[\s\S]*?</script>', ' ', html, flags=re.IGNORECASE)
     clean_source = re.sub(r'<style[^>]*>[\s\S]*?</style>', ' ', clean_source, flags=re.IGNORECASE)
+    expired = is_expired_detail_html(clean_source)
 
     cutoff = clean_source.find('id="jobad_other_ads_c"')
     if cutoff == -1:
@@ -28,6 +46,8 @@ def extract_description_from_detail_html(html: str) -> Optional[str]:
     )
 
     parts = []
+    if expired:
+        parts.append("Skelbimas neaktyvus")
     for heading, body in blocks:
         h_clean = unescape(re.sub(r'<[^>]+>', ' ', heading)).strip() if heading else ""
         b_clean = unescape(re.sub(r'<[^>]+>', ' ', body)).strip()

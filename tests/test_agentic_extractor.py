@@ -9,11 +9,14 @@ integration. The *semantic* quality of the real model is checked live with:
     py -m execution.agentic_extractor
 """
 import json
+import os
+import tempfile
 import unittest
+from unittest.mock import patch
 
 from execution.agentic_extractor import (
     AgenticExtractor, RequirementExtraction, apply_extraction, parse_extraction,
-    build_prompt, EXTRACTION_SCHEMA, SYSTEM_INSTRUCTION,
+    build_prompt, load_env, _parse_dotenv_lines, EXTRACTION_SCHEMA, SYSTEM_INSTRUCTION,
 )
 from execution.evaluate import evaluate_job, EVALUATOR_VERSION
 from execution.models import CandidateProfile, RawJobListing, Recommendation
@@ -255,6 +258,45 @@ class TestPipelineIntegration(unittest.TestCase):
         self.assertEqual(p2.last_run_stats["evaluated"], 2)
         store.close()
         extractor.close()
+
+
+class TestDotenvLoading(unittest.TestCase):
+
+    def test_parse_dotenv_handles_comments_quotes_and_export(self):
+        raw = (
+            "# Comment line\n"
+            "GEMINI_API_KEY=test_key_123   # inline comment\n"
+            "QUOTED_DOUBLE=\"value # with hash\"\n"
+            "QUOTED_SINGLE='single_quoted'\n"
+            "export EXPORTED_VAR=exported_val\n"
+            "EMPTY_COMMENT=# nothing\n"
+        )
+        parsed = _parse_dotenv_lines(raw)
+        self.assertEqual(parsed["GEMINI_API_KEY"], "test_key_123")
+        self.assertEqual(parsed["QUOTED_DOUBLE"], "value # with hash")
+        self.assertEqual(parsed["QUOTED_SINGLE"], "single_quoted")
+        self.assertEqual(parsed["EXPORTED_VAR"], "exported_val")
+        self.assertEqual(parsed["EMPTY_COMMENT"], "")
+
+    def test_load_env_populates_missing_or_blank_env_vars(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = os.path.join(tmp, ".env")
+            with open(env_path, "w", encoding="utf-8-sig") as f:
+                f.write("GEMINI_API_KEY=from_dotenv_key\nCUSTOM_OE_VAR=hello\n")
+
+            with patch.dict(os.environ, {"GEMINI_API_KEY": ""}, clear=False):
+                os.environ.pop("CUSTOM_OE_VAR", None)
+                load_env(dotenv_path=env_path)
+                self.assertEqual(os.environ.get("GEMINI_API_KEY"), "from_dotenv_key")
+                self.assertEqual(os.environ.get("CUSTOM_OE_VAR"), "hello")
+
+                # Existing non-empty variable is not overwritten unless override=True
+                with open(env_path, "w", encoding="utf-8") as f:
+                    f.write("GEMINI_API_KEY=updated_key\n")
+                load_env(dotenv_path=env_path, override=False)
+                self.assertEqual(os.environ.get("GEMINI_API_KEY"), "from_dotenv_key")
+                load_env(dotenv_path=env_path, override=True)
+                self.assertEqual(os.environ.get("GEMINI_API_KEY"), "updated_key")
 
 
 if __name__ == "__main__":

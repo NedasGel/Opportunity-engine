@@ -496,6 +496,22 @@ py -m execution.pipeline --no-state           # stateless run, DB untouched
 py -m execution.pipeline --db path/to/state.db
 ```
 
+## Kaip paleisti vartotojo sąsają (Dashboard) naršyklėje
+
+Norint peržiūrėti visus išfiltruotus ir įvertintus darbo skelbimus grafinėje aplinkoje (atsidarys naršyklės langas), terminale naudokite šią komandą:
+
+```bash
+py -m streamlit run dashboard.py
+
+## Kaip paleisti sistemą su AI (Gemini) vertinimu
+
+Kad sistema skaitytų darbo skelbimus naudodama dirbtinį intelektą (o ne paprastas teksto paieškos taisykles), terminale būtina nustatyti Gemini API raktą. Šis raktas galioja tol, kol uždarote terminalo langą.
+
+**1. Nustatykite API raktą (PowerShell aplinkoje):**
+```powershell
+$env:GEMINI_API_KEY="JŪSŲ_API_RAKTAS_ČIA"
+
+
 By default the report contains all known jobs seen in this run (cached + newly evaluated). Jobs first seen in this run are tagged `[NEW]`.
 
 Generated reports, the state database and temporary execution artifacts are written to `.tmp/`.

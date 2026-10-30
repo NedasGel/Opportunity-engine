@@ -2,15 +2,21 @@ import os
 import argparse
 from typing import Dict, List, Tuple, Optional, Set, Union
 from .models import (
-    CandidateProfile, RawJobListing, NormalizedJob, EvaluationResult, Recommendation
+    CandidateProfile, RawJobListing, NormalizedJob, EvaluationResult, Recommendation,
+    ApplicationStatus, APPLICATION_STATUSES,
 )
 from .normalize import normalize_job
 from .deduplicate import deduplicate_jobs
 from .evaluate import evaluate_job, EVALUATOR_VERSION
 from .prefilter import prefilter_job, PrefilteredJob
-from .state import JobStateStore, JobRecord, DEFAULT_DB_PATH, STATUS_EVALUATED, STATUS_REJECTED_PREFILTER
+from .state import (
+    JobStateStore, JobRecord, DEFAULT_DB_PATH, STATUS_EVALUATED, STATUS_REJECTED_PREFILTER,
+    is_job_expired,
+)
 from .report import format_markdown_report, format_json_report
-from .agentic_extractor import AgenticExtractor, apply_extraction, DEFAULT_MODEL as DEFAULT_EXTRACTION_MODEL
+from .agentic_extractor import (
+    AgenticExtractor, apply_extraction, load_env, DEFAULT_MODEL as DEFAULT_EXTRACTION_MODEL
+)
 from .sources.base import JobSource
 from .sources.mock_source import MockJobSource
 from .sources.cvbankas import CVBankasSource
@@ -18,6 +24,9 @@ from .sources.cvonline import CVOnlineSource
 from .sources.linkedin import LinkedInSource
 from .sources.cvmarket import CVMarketSource
 from .sources.work_in_lithuania import WorkInLithuaniaSource
+
+# Ensure environment variables from project root .env are loaded automatically.
+load_env()
 
 # Configurable discovery queries tailored to 2nd-year AI student recall
 DEFAULT_DISCOVERY_QUERIES = [
@@ -71,6 +80,8 @@ class JobDiscoveryPipeline:
             raise ValueError("report_scope must be 'all' or 'new'")
         self.report_scope = report_scope
         self.extractor = extractor if (extractor and extractor.available) else None
+        if self.state is not None and self.extractor is not None and not self.state.evaluator_version_suffix:
+            self.state.evaluator_version_suffix = f"+{self.extractor.version_tag}"
         self.last_run_stats: Dict[str, int] = {}
         self.last_prefiltered: List[PrefilteredJob] = []
         self.last_extraction_stats: Dict[str, int] = {}
@@ -127,12 +138,19 @@ class JobDiscoveryPipeline:
             plan = [(job, None, job.job_id) for job in deduped_listings]
 
         new_job_ids: Set[str] = set()
+        active_keys: Set[str] = set()
+        expired_keys: Set[str] = set()
         cached_results: List[EvaluationResult] = []
         prefiltered: List[PrefilteredJob] = []
-        to_evaluate: List[Tuple[NormalizedJob, str]] = []
+        to_evaluate: List[Tuple[NormalizedJob, Optional[JobRecord], str]] = []
         newly_prefiltered: List[Tuple[NormalizedJob, str, str]] = []
 
         for job, record, key in plan:
+            if is_job_expired(job):
+                expired_keys.add(key)
+                continue
+
+            active_keys.add(key)
             if record is None:
                 new_job_ids.add(job.job_id)
 
@@ -140,7 +158,10 @@ class JobDiscoveryPipeline:
                 job, record, force=self.force_reeval, prefilter_enabled=self.enable_prefilter
             ):
                 if record.status == STATUS_EVALUATED:
-                    cached_results.append(self.state.load_cached_result(record))
+                    cached_ev = self.state.load_cached_result(record)
+                    cached_ev.is_active = True
+                    cached_ev.normalized_job.is_active = True
+                    cached_results.append(cached_ev)
                     continue
                 if record.status == STATUS_REJECTED_PREFILTER:
                     prefiltered.append(PrefilteredJob(job, record.prefilter_reason or "", from_cache=True))
@@ -153,15 +174,17 @@ class JobDiscoveryPipeline:
                     prefiltered.append(PrefilteredJob(job, decision.reason))
                     newly_prefiltered.append((job, decision.reason, key))
                     continue
-            to_evaluate.append((job, key))
+            to_evaluate.append((job, record, key))
 
         # 6. EXTRACT: semantic (LLM) requirement extraction overrides regex heuristics.
         #    Jobs whose extraction fails keep regex values and are tagged with the base
         #    evaluator version so they are retried on the next run.
         if self.extractor and to_evaluate:
             before = dict(self.extractor.stats)
-            extractions = self.extractor.extract_many([(job.title, job.description) for job, _ in to_evaluate])
-            for (job, _), extraction in zip(to_evaluate, extractions):
+            extractions = self.extractor.extract_many(
+                [(job.title, job.description, job.salary) for job, _, _ in to_evaluate]
+            )
+            for (job, _, _), extraction in zip(to_evaluate, extractions):
                 if extraction is not None:
                     apply_extraction(job, extraction)
             self.last_extraction_stats = {
@@ -176,8 +199,22 @@ class JobDiscoveryPipeline:
         # 7. EVALUATE (only what survived state + pre-filter)
         new_results: List[EvaluationResult] = []
         result_keys: List[str] = []
-        for job, key in to_evaluate:
-            new_results.append(evaluate_job(job, self.profile))
+        for job, record, key in to_evaluate:
+            ev = evaluate_job(job, self.profile)
+            if record is not None:
+                preserved_status = (
+                    ApplicationStatus(record.application_status)
+                    if record.application_status in APPLICATION_STATUSES
+                    else ApplicationStatus.NEW
+                )
+                preserved_notes = record.user_notes or ""
+                ev.application_status = preserved_status
+                ev.user_notes = preserved_notes
+                ev.normalized_job.application_status = preserved_status
+                ev.normalized_job.user_notes = preserved_notes
+            ev.is_active = True
+            ev.normalized_job.is_active = True
+            new_results.append(ev)
             result_keys.append(key)
 
         stats = {
@@ -186,6 +223,7 @@ class JobDiscoveryPipeline:
             "evaluated": len(new_results),
             "cached": len(cached_results),
             "prefiltered": len(prefiltered),
+            "expired": len(expired_keys),
         }
 
         # 8. PERSIST (single atomic transaction)
@@ -198,6 +236,10 @@ class JobDiscoveryPipeline:
                     self.state.mark_evaluated(
                         result, key, evaluator_version=EVALUATOR_VERSION if fallback else None
                     )
+                for key in expired_keys:
+                    self.state.mark_inactive(key)
+                if deduped_listings:
+                    stats["inactive_marked"] = self.state.sync_active_jobs(active_keys)
             self.state.finish_run(run_id, stats)
 
         self.last_run_stats = stats
@@ -241,6 +283,7 @@ class JobDiscoveryPipeline:
 
 
 def main():
+    load_env()
     parser = argparse.ArgumentParser(description="Run Multi-Source Opportunity Engine Job Discovery Pipeline")
     parser.add_argument("--query", type=str, default=None, help="Custom search query or comma-separated queries")
     parser.add_argument(

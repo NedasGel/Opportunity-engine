@@ -4,7 +4,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from execution.models import RawJobListing, CandidateProfile, evaluation_to_dict, evaluation_from_dict
+from execution.models import (
+    RawJobListing, CandidateProfile, ApplicationStatus, APPLICATION_STATUSES,
+    evaluation_to_dict, evaluation_from_dict,
+)
 from execution.normalize import normalize_job
 from execution.evaluate import evaluate_job
 from execution import state as state_mod
@@ -27,6 +30,20 @@ class TestSerialization(unittest.TestCase):
     def test_evaluation_round_trip_is_lossless(self):
         result = evaluate_job(make_job(), CandidateProfile())
         self.assertEqual(evaluation_from_dict(evaluation_to_dict(result)), result)
+
+    def test_legacy_evaluation_dict_without_tracking_fields_loads_defaults(self):
+        result = evaluate_job(make_job(), CandidateProfile())
+        payload = evaluation_to_dict(result)
+        payload.pop("application_status", None)
+        payload.pop("user_notes", None)
+        payload["normalized_job"].pop("application_status", None)
+        payload["normalized_job"].pop("user_notes", None)
+
+        restored = evaluation_from_dict(payload)
+        self.assertEqual(restored.application_status, ApplicationStatus.NEW)
+        self.assertEqual(restored.user_notes, "")
+        self.assertEqual(restored.normalized_job.application_status, ApplicationStatus.NEW)
+        self.assertEqual(restored.normalized_job.user_notes, "")
 
 
 class TestJobStateStore(unittest.TestCase):
@@ -152,6 +169,178 @@ class TestJobStateStore(unittest.TestCase):
         row = self.store.conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         self.assertEqual(row["evaluated"], 4)
         self.assertIsNotNone(row["finished_at"])
+
+    def test_application_status_and_notes_update_and_persist(self):
+        job = make_job()
+        result = evaluate_job(job, CandidateProfile())
+        with self.store.transaction():
+            self.store.mark_evaluated(result)
+
+        rec = self.store.get(job.job_id)
+        self.assertEqual(rec.application_status, "NEW")
+        self.assertEqual(rec.user_notes, "")
+
+        for status in APPLICATION_STATUSES:
+            note = f"Note for {status}"
+            ok = self.store.update_application_status(job.job_id, status, user_notes=note)
+            self.assertTrue(ok)
+            updated_rec = self.store.get(job.job_id)
+            self.assertEqual(updated_rec.application_status, status)
+            self.assertEqual(updated_rec.user_notes, note)
+            cached = self.store.load_cached_result(updated_rec)
+            self.assertEqual(cached.application_status, status)
+            self.assertEqual(cached.user_notes, note)
+
+        self.assertTrue(self.store.update_user_notes(job.job_id, "Updated note only"))
+        final_rec = self.store.get(job.job_id)
+        self.assertEqual(final_rec.application_status, "ARCHIVED")
+        self.assertEqual(final_rec.user_notes, "Updated note only")
+
+    def test_invalid_application_status_rejected(self):
+        job = make_job()
+        with self.store.transaction():
+            self.store.mark_evaluated(evaluate_job(job, CandidateProfile()))
+        with self.assertRaises(ValueError):
+            self.store.update_application_status(job.job_id, "INVALID_STATUS")
+
+    def test_reevaluation_never_overwrites_application_status_or_notes(self):
+        job = make_job()
+        with self.store.transaction():
+            self.store.mark_evaluated(evaluate_job(job, CandidateProfile()))
+
+        self.store.update_application_status(
+            job.job_id, ApplicationStatus.APPLIED, user_notes="Sent CV via LinkedIn"
+        )
+
+        # Re-evaluating the same job with a fresh EvaluationResult (default NEW / empty notes)
+        fresh_result = evaluate_job(job, CandidateProfile())
+        self.assertEqual(fresh_result.application_status, ApplicationStatus.NEW)
+        self.assertEqual(fresh_result.user_notes, "")
+
+        with self.store.transaction():
+            self.store.mark_evaluated(fresh_result)
+
+        rec = self.store.get(job.job_id)
+        self.assertEqual(rec.application_status, "APPLIED")
+        self.assertEqual(rec.user_notes, "Sent CV via LinkedIn")
+        cached = self.store.load_cached_result(rec)
+        self.assertEqual(cached.application_status, ApplicationStatus.APPLIED)
+        self.assertEqual(cached.user_notes, "Sent CV via LinkedIn")
+
+    def test_legacy_sqlite_schema_migrates_seamlessly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "legacy.db")
+            conn = sqlite3.connect(db_path)
+            conn.executescript("""
+                CREATE TABLE jobs (
+                    job_id             TEXT PRIMARY KEY,
+                    status             TEXT NOT NULL,
+                    title              TEXT NOT NULL,
+                    company            TEXT NOT NULL,
+                    location           TEXT,
+                    source             TEXT,
+                    job_url            TEXT,
+                    content_hash       TEXT NOT NULL,
+                    prefilter_reason   TEXT,
+                    prefilter_version  TEXT,
+                    evaluator_version  TEXT,
+                    recommendation     TEXT,
+                    total_score        REAL,
+                    evaluation_json    TEXT,
+                    first_seen_at      TEXT NOT NULL,
+                    last_seen_at       TEXT NOT NULL,
+                    evaluated_at       TEXT,
+                    seen_count         INTEGER NOT NULL DEFAULT 1
+                );
+                INSERT INTO jobs (job_id, status, title, company, content_hash, first_seen_at, last_seen_at)
+                VALUES ('legacy-1', 'EVALUATED', 'AI Intern', 'Acme', 'hash1', '2026-01-01', '2026-01-01');
+            """)
+            conn.close()
+
+            with JobStateStore(db_path) as store:
+                rec = store.get("legacy-1")
+                self.assertIsNotNone(rec)
+                self.assertEqual(rec.application_status, "NEW")
+                self.assertEqual(rec.user_notes, "")
+                store.update_application_status("legacy-1", "SAVED", "Need to customize cover letter")
+                rec2 = store.get("legacy-1")
+                self.assertEqual(rec2.application_status, "SAVED")
+                self.assertEqual(rec2.user_notes, "Need to customize cover letter")
+
+
+class TestDashboardTracking(unittest.TestCase):
+
+    def test_dashboard_load_and_persist_tracking(self):
+        import dashboard
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "dash.db")
+            job = make_job()
+            with JobStateStore(db_path) as store:
+                with store.transaction():
+                    store.mark_evaluated(evaluate_job(job, CandidateProfile()))
+
+            dashboard.load_data.clear()
+            jobs = dashboard.load_data(db_path=db_path)
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual(jobs[0]["application_status"], "NEW")
+            self.assertEqual(jobs[0]["user_notes"], "")
+            self.assertEqual(dashboard.format_status_badge("NEW"), "🆕 NEW")
+            self.assertEqual(dashboard.format_status_badge("APPLIED"), "📨 APPLIED")
+
+            ok = dashboard.persist_job_tracking(
+                job_id=job.job_id,
+                application_status="SAVED",
+                user_notes="Follow up Monday",
+                db_path=db_path,
+            )
+            self.assertTrue(ok)
+
+            jobs_after = dashboard.load_data(db_path=db_path)
+            self.assertEqual(jobs_after[0]["application_status"], "SAVED")
+            self.assertEqual(jobs_after[0]["user_notes"], "Follow up Monday")
+
+    def test_dashboard_filter_hides_expired_new_jobs_but_keeps_pinned_statuses(self):
+        import dashboard
+        from execution.models import ACTIVE_APPLICATION_STATUSES
+
+        sample_jobs = [
+            {"job_id": "active-new", "recommendation": "APPLY", "total_score": 90.0, "application_status": "NEW", "is_active": True},
+            {"job_id": "expired-new", "recommendation": "APPLY", "total_score": 85.0, "application_status": "NEW", "is_active": False},
+            {"job_id": "expired-saved", "recommendation": "APPLY", "total_score": 80.0, "application_status": "SAVED", "is_active": False},
+            {"job_id": "expired-applied", "recommendation": "CONSIDER", "total_score": 78.0, "application_status": "APPLIED", "is_active": False},
+            {"job_id": "expired-interview", "recommendation": "CONSIDER", "total_score": 76.0, "application_status": "INTERVIEW", "is_active": False},
+            {"job_id": "expired-offer", "recommendation": "APPLY", "total_score": 95.0, "application_status": "OFFER", "is_active": False},
+            {"job_id": "expired-archived", "recommendation": "APPLY", "total_score": 88.0, "application_status": "ARCHIVED", "is_active": False},
+        ]
+
+        # Default view (show_historical=False): hides expired NEW, keeps active NEW + pinned statuses
+        default_filtered = dashboard.filter_dashboard_jobs(
+            sample_jobs,
+            selected_statuses=list(ACTIVE_APPLICATION_STATUSES),
+            selected_tiers=["APPLY", "CONSIDER"],
+            min_score=0.0,
+            show_historical=False,
+        )
+        default_ids = [j["job_id"] for j in default_filtered]
+        self.assertIn("active-new", default_ids)
+        self.assertNotIn("expired-new", default_ids)
+        self.assertIn("expired-saved", default_ids)
+        self.assertIn("expired-applied", default_ids)
+        self.assertIn("expired-interview", default_ids)
+        self.assertIn("expired-offer", default_ids)
+        self.assertNotIn("expired-archived", default_ids)
+
+        # Historical view (show_historical=True): also includes expired NEW
+        hist_filtered = dashboard.filter_dashboard_jobs(
+            sample_jobs,
+            selected_statuses=list(ACTIVE_APPLICATION_STATUSES),
+            selected_tiers=["APPLY", "CONSIDER"],
+            min_score=0.0,
+            show_historical=True,
+        )
+        hist_ids = [j["job_id"] for j in hist_filtered]
+        self.assertIn("expired-new", hist_ids)
 
 
 if __name__ == "__main__":

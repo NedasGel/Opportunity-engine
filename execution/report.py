@@ -44,7 +44,8 @@ def format_markdown_report(
         lines.append(f"- **Employment Type**: {job.employment_type.value.replace('_', ' ').capitalize()}")
         lines.append(f"- **Salary**: {job.salary or 'Not stated'}")
         lines.append(f"- **Match Score**: **{ev.total_score}/100**")
-        lines.append(f"- **Score Breakdown**: Domain: {sb.ai_relevance}/40 | Tech Skills: {sb.technical_skill_overlap}/15 | Student/Exp: {sb.student_compatibility}/20 | Schedule: {sb.schedule_compatibility}/10 | Location: {sb.location_compatibility}/10 | Language: {sb.language_compatibility}/5")
+        penalty_part = f" | Implicit Concerns: -{sb.implicit_concern_penalty}" if sb.implicit_concern_penalty else ""
+        lines.append(f"- **Score Breakdown**: Domain: {sb.ai_relevance}/40 | Tech Skills: {sb.technical_skill_overlap}/15 | Student/Exp: {sb.student_compatibility}/20 | Schedule: {sb.schedule_compatibility}/10 | Location: {sb.location_compatibility}/10 | Language: {sb.language_compatibility}/5{penalty_part}")
         lines.append("")
 
         lines.append("### WHY IT MATCHES")
@@ -61,6 +62,16 @@ def format_markdown_report(
             lines.append("### CONCERNS")
             for c in ev.concerns:
                 lines.append(f"- {c}")
+            lines.append("")
+
+        if ev.implicit_concerns:
+            lines.append("### IMPLICIT CONCERNS")
+            for ic in ev.implicit_concerns:
+                quote = f' — "{ic.evidence}"' if ic.evidence and ic.source == "llm" else ""
+                lines.append(
+                    f"- [{ic.severity.upper()}, -{ic.penalty}] {ic.category.replace('_', ' ').title()}: "
+                    f"{ic.description}{quote}"
+                )
             lines.append("")
 
         if ev.missing_information:
@@ -140,6 +151,12 @@ def format_json_report(
             "salary": job.salary,
             "total_score": ev.total_score,
             "recommendation": ev.recommendation.value,
+            "application_status": (
+                ev.application_status.value
+                if hasattr(ev.application_status, "value")
+                else str(ev.application_status or "NEW")
+            ),
+            "user_notes": ev.user_notes or "",
             "score_breakdown": {
                 "ai_relevance": sb.ai_relevance,
                 "student_compatibility": sb.student_compatibility,
@@ -147,12 +164,20 @@ def format_json_report(
                 "schedule_compatibility": sb.schedule_compatibility,
                 "education_compatibility": sb.education_compatibility,
                 "technical_skill_overlap": sb.technical_skill_overlap,
-                "language_compatibility": sb.language_compatibility
+                "language_compatibility": sb.language_compatibility,
+                "implicit_concern_penalty": sb.implicit_concern_penalty,
             },
             "strong_matches": ev.strong_matches,
             "weak_matches": ev.weak_matches,
             "missing_information": ev.missing_information,
             "concerns": ev.concerns,
+            "implicit_concerns": [
+                {
+                    "category": ic.category, "severity": ic.severity, "description": ic.description,
+                    "evidence": ic.evidence, "source": ic.source, "penalty": ic.penalty,
+                }
+                for ic in ev.implicit_concerns
+            ],
             "hard_blockers": ev.hard_blockers,
             "soft_penalties": ev.soft_penalties,
             "job_url": job.job_url,

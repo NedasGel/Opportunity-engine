@@ -12,12 +12,21 @@ return structured requirement facts:
     preferred_experience_years  int | null   ("nice to have" years -> soft penalty only)
     requires_degree             bool         (COMPLETED degree is mandatory)
     is_strictly_full_time       bool         (full-time only, no flexible/part-time option)
+    seniority_level             enum         (holistic level the role is ACTUALLY pitched at)
+    implicit_concerns           array        (implied red flags for a student, closed taxonomy,
+                                              each backed by a verbatim quote)
+    salary                      object       (raw salary facts; normalised deterministically here)
     evidence                    str          (verbatim quotes justifying the values)
+
+Separation of concerns ("the LLM perceives, the evaluator decides"):
+  * The LLM only reports facts + a severity judgement per concern.
+  * Salary normalisation (period / net->gross) and evidence grounding are deterministic code here.
+  * Penalties, caps and recommendation gates live exclusively in `evaluate.py`.
 
 Design guarantees:
   * Deterministic fallback: if the SDK, API key, or a call is unavailable, the
     extractor returns None and the pipeline keeps the regex-derived values.
-  * Results are cached in SQLite keyed by (prompt version, model, title, description),
+  * Results are cached in SQLite keyed by (prompt version, model, title, description, salary),
     so unchanged listings are never re-sent to the model.
   * Cache I/O stays on the calling thread; only network calls run in a thread pool.
 """
@@ -28,18 +37,100 @@ import sqlite3
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from dataclasses import asdict, dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
-from .models import NormalizedJob, EvidenceItem, FactType
+from .models import (
+    NormalizedJob, EvidenceItem, FactType, ImplicitConcern,
+    CONCERN_CATEGORIES, CONCERN_SEVERITIES, SENIORITY_LEVELS,
+)
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_DOTENV_PATH = os.path.join(PROJECT_ROOT, ".env")
+
+
+def _parse_dotenv_lines(content: str) -> Dict[str, str]:
+    """Lightweight built-in .env parser fallback when python-dotenv is not installed."""
+    parsed: Dict[str, str] = {}
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if not key:
+            continue
+        if len(val) >= 2 and val[0] in ('"', "'") and val[0] in val[1:]:
+            quote = val[0]
+            end_idx = val.find(quote, 1)
+            val = val[1:end_idx]
+        else:
+            if val.startswith("#"):
+                val = ""
+            else:
+                for sep in (" #", "\t#"):
+                    if sep in val:
+                        val = val.split(sep, 1)[0].strip()
+        parsed[key] = val
+    return parsed
+
+
+def load_env(dotenv_path: Optional[str] = None, override: bool = False) -> Dict[str, str]:
+    """Load environment variables from a .env file in the project root.
+
+    Uses `python-dotenv` if installed, and always runs a lightweight built-in
+    fallback parser so GEMINI_API_KEY is reliably populated without extra packages.
+    """
+    path = dotenv_path or DEFAULT_DOTENV_PATH
+    if not path or not os.path.isfile(path):
+        return {}
+
+    try:
+        from dotenv import load_dotenv  # type: ignore
+        load_dotenv(dotenv_path=path, override=override)
+    except ImportError:
+        pass
+
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            parsed = _parse_dotenv_lines(f.read())
+    except OSError:
+        return {}
+
+    loaded: Dict[str, str] = {}
+    for key, val in parsed.items():
+        existing = os.environ.get(key)
+        if override or existing is None or (not existing.strip() and val):
+            os.environ[key] = val
+            loaded[key] = val
+    return loaded
+
+
+# Auto-load .env on module import so GEMINI_API_KEY and OE_EXTRACTION_MODEL are ready.
+load_env()
 
 # Bump whenever SYSTEM_INSTRUCTION or EXTRACTION_SCHEMA changes: invalidates the
 # extraction cache and (via the pipeline) any cached evaluations built on it.
-PROMPT_VERSION = "1"
+PROMPT_VERSION = "2"
 
 DEFAULT_MODEL = os.environ.get("OE_EXTRACTION_MODEL", "gemini-3.5-flash-lite")
 MAX_DESCRIPTION_CHARS = 12000
 MAX_REASONABLE_YEARS = 30
+MAX_CONCERNS = 6
+MAX_REASONABLE_SALARY = 1_000_000
+
+# Salary normalisation constants (Lithuania).
+HOURS_PER_MONTH = 168          # 21 working days x 8 h
+DAYS_PER_MONTH = 21
+NET_TO_GROSS_FACTOR = 1.6      # LT employee net pay is ~62% of gross ("į rankas" -> "neatskaičius")
+SALARY_CURRENCIES = ("EUR", "USD", "GBP", "PLN", "OTHER", "NONE")
+SALARY_PERIODS = ("month", "year", "hour", "day", "unknown")
+SALARY_BASES = ("gross", "net", "unknown")
 
 DEFAULT_CACHE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -71,6 +162,44 @@ EXTRACTION_SCHEMA: Dict = {
             "type": "boolean",
             "description": "True only if the role is full-time with no part-time / flexible / student-schedule option.",
         },
+        "seniority_level": {
+            "type": "string",
+            "enum": list(SENIORITY_LEVELS),
+            "description": "The level the role is actually pitched at, judged from responsibilities, scope and pay - not only the title.",
+        },
+        "implicit_concerns": {
+            "type": "array",
+            "maxItems": MAX_CONCERNS,
+            "description": "Implied red flags for a university student with no professional experience. Empty array if none.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string", "enum": list(CONCERN_CATEGORIES)},
+                    "severity": {"type": "string", "enum": list(CONCERN_SEVERITIES)},
+                    "description": {
+                        "type": "string",
+                        "description": "One sentence explaining why this is a concern for a student.",
+                    },
+                    "evidence": {
+                        "type": "string",
+                        "description": "Short verbatim quote from the listing that triggers the concern.",
+                    },
+                },
+                "required": ["category", "severity", "description", "evidence"],
+            },
+        },
+        "salary": {
+            "type": "object",
+            "description": "Salary exactly as stated in the listing (no conversions). Numbers null if not stated.",
+            "properties": {
+                "min": {"type": ["number", "null"], "minimum": 0},
+                "max": {"type": ["number", "null"], "minimum": 0},
+                "currency": {"type": "string", "enum": list(SALARY_CURRENCIES)},
+                "period": {"type": "string", "enum": list(SALARY_PERIODS)},
+                "basis": {"type": "string", "enum": list(SALARY_BASES)},
+            },
+            "required": ["min", "max", "currency", "period", "basis"],
+        },
         "evidence": {
             "type": "string",
             "description": "Up to 3 short verbatim quotes from the listing that justify the values, separated by ' | '.",
@@ -81,6 +210,9 @@ EXTRACTION_SCHEMA: Dict = {
         "preferred_experience_years",
         "requires_degree",
         "is_strictly_full_time",
+        "seniority_level",
+        "implicit_concerns",
+        "salary",
         "evidence",
     ],
 }
@@ -118,9 +250,58 @@ is_strictly_full_time (boolean):
   "1 etatas", "полная занятость") AND offers no part-time, flexible-hours, or study-compatible schedule.
 - false if part-time / flexible / working-student / internship hours are offered, or the schedule is not stated.
 
+seniority_level (enum):
+- Judge the level the employer ACTUALLY expects from the whole listing: scope of responsibility, autonomy,
+  who the person reports to / leads, expected impact, and pay. The title alone is not decisive - a "Developer"
+  who "owns the architecture", "leads customer workshops" and earns 5000+ EUR is "senior".
+- "student_or_intern": internship / trainee / working-student / explicitly for students.
+- "junior": entry-level, learning-oriented, works under guidance.
+- "mid": independent contributor expected to deliver without close supervision.
+- "senior": designs systems, owns technical decisions, mentors others, faces clients as the expert.
+- "lead_or_principal": leads a team / function, sets technical direction or strategy.
+- "unclear": genuinely not enough information.
+
+implicit_concerns (array, at most 6, most severe first):
+The candidate is a 2nd-year university student with ZERO professional experience who attends lectures in Vilnius.
+List responsibilities or conditions that would make the role unrealistic or stressful for such a student even though
+they are NOT stated as an explicit years/degree/full-time requirement. Do NOT repeat explicit experience-years, degree,
+or full-time facts (they have dedicated fields). Do NOT create concerns about salary (use the salary field).
+Do NOT flag ordinary junior expectations (learning a stack, code reviews, teamwork, using Git).
+Categories:
+- implicit_seniority: owning architecture / system design, technical leadership, mentoring others, defining roadmaps
+  or standards, being "the expert" / "go-to person", building something from scratch alone.
+- client_facing_leadership: leading customer workshops, pre-sales, consulting clients, requirements gathering
+  with executives, representing the company as the technical authority.
+- people_management: managing, hiring, or evaluating people; team-lead duties.
+- production_ownership: sole or primary accountability for business-critical production systems, SLAs, uptime.
+- demanding_schedule: shifts, nights, weekends, on-call rotations, regular overtime, frequent business travel.
+- high_pressure_environment: aggressive deadlines/KPIs/quotas, "wear all hats" alone, crunch, high-stakes decisions.
+- advanced_expertise: expectations of expert-level depth (published research, PhD-level work, deep niche specialisation,
+  professional certifications) without stating years.
+- eligibility_constraint: security clearance, citizenship, driving licence with own car, mandatory relocation.
+- other: anything else clearly unsuitable for a student.
+Severity (relative to this student):
+- "critical": the core of the job is clearly impossible for a student (e.g. leading a team, sole owner of the platform
+  architecture, acting as the senior consultant for enterprise clients).
+- "high": a core responsibility that normally takes several years of professional experience.
+- "medium": a notable stretch or strain that a strong student might handle with support.
+- "low": minor friction.
+Each item: one-sentence description + a SHORT verbatim quote copied exactly from the listing as evidence.
+Return an empty array if there are no such concerns.
+
+salary (object):
+- Copy the numbers exactly as stated in the listing or in the LISTED SALARY line; do NOT convert.
+  "min"/"max": lower/upper bound (same value for a single figure; null if not stated).
+  "currency": EUR/USD/GBP/PLN, OTHER, or NONE when no salary is given.
+  "period": month / year / hour / day, or unknown.
+  "basis": gross ("bruto", "neatskaičius mokesčių", "before taxes"), net ("neto", "į rankas", "atskaičius mokesčius"),
+  or unknown.
+
 evidence (string):
 - Up to 3 short verbatim quotes from the listing supporting your values, separated by " | ". Empty string if none.
 """
+
+_EMPTY_SALARY: Dict[str, Any] = {"min": None, "max": None, "currency": "NONE", "period": "unknown", "basis": "unknown"}
 
 
 @dataclass
@@ -130,12 +311,25 @@ class RequirementExtraction:
     requires_degree: bool
     is_strictly_full_time: bool
     evidence: str = ""
+    seniority_level: str = "unclear"
+    implicit_concerns: List[ImplicitConcern] = field(default_factory=list)
+    salary: Dict[str, Any] = field(default_factory=lambda: dict(_EMPTY_SALARY))
     model: str = ""
 
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), ensure_ascii=False)
 
-def build_prompt(title: str, description: str) -> str:
+    @classmethod
+    def from_json(cls, raw: str) -> "RequirementExtraction":
+        data = json.loads(raw)
+        data["implicit_concerns"] = [ImplicitConcern(**c) for c in data.get("implicit_concerns", [])]
+        return cls(**data)
+
+
+def build_prompt(title: str, description: str, salary: Optional[str] = None) -> str:
     desc = (description or "")[:MAX_DESCRIPTION_CHARS]
-    return f"JOB TITLE: {title}\n\nJOB DESCRIPTION:\n<<<\n{desc}\n>>>"
+    salary_line = f"LISTED SALARY: {salary}\n\n" if salary else ""
+    return f"JOB TITLE: {title}\n\n{salary_line}JOB DESCRIPTION:\n<<<\n{desc}\n>>>"
 
 
 def _coerce_years(value, field_name: str) -> Optional[int]:
@@ -152,8 +346,65 @@ def _coerce_years(value, field_name: str) -> Optional[int]:
     return value
 
 
+# --- Enrichment fields are parsed leniently: a malformed concern is dropped, it never
+# --- discards the (strictly validated) core requirement facts above.
+
+def _parse_concerns(raw: Any) -> List[ImplicitConcern]:
+    if not isinstance(raw, list):
+        return []
+    concerns: List[ImplicitConcern] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        severity = str(item.get("severity", "")).strip().lower()
+        description = str(item.get("description") or "").strip()
+        if severity not in CONCERN_SEVERITIES or not description:
+            continue
+        category = str(item.get("category", "")).strip().lower()
+        if category not in CONCERN_CATEGORIES:
+            category = "other"
+        concerns.append(ImplicitConcern(
+            category=category,
+            severity=severity,
+            description=description[:300],
+            evidence=str(item.get("evidence") or "").strip()[:300],
+            source="llm",
+        ))
+        if len(concerns) >= MAX_CONCERNS:
+            break
+    return concerns
+
+
+def _parse_salary(raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        return dict(_EMPTY_SALARY)
+
+    def _amount(v):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        return float(v) if 0 < v <= MAX_REASONABLE_SALARY else None
+
+    def _enum(v, allowed, default):
+        v = str(v or "").strip()
+        for a in allowed:
+            if v.lower() == a.lower():
+                return a
+        return default
+
+    lo, hi = _amount(raw.get("min")), _amount(raw.get("max"))
+    if lo is not None and hi is not None and lo > hi:
+        lo, hi = hi, lo
+    return {
+        "min": lo,
+        "max": hi,
+        "currency": _enum(raw.get("currency"), SALARY_CURRENCIES, "NONE"),
+        "period": _enum(raw.get("period"), SALARY_PERIODS, "unknown"),
+        "basis": _enum(raw.get("basis"), SALARY_BASES, "unknown"),
+    }
+
+
 def parse_extraction(raw_text: str, model: str = "") -> RequirementExtraction:
-    """Validate the model's JSON output. Raises ValueError on any schema violation."""
+    """Validate the model's JSON output. Raises ValueError on any core-field schema violation."""
     try:
         data = json.loads(raw_text)
     except (TypeError, json.JSONDecodeError) as e:
@@ -166,12 +417,16 @@ def parse_extraction(raw_text: str, model: str = "") -> RequirementExtraction:
     evidence = data.get("evidence") or ""
     if not isinstance(evidence, str):
         evidence = str(evidence)
+    seniority = str(data.get("seniority_level") or "unclear").strip().lower()
     return RequirementExtraction(
         required_experience_years=_coerce_years(data.get("required_experience_years"), "required_experience_years"),
         preferred_experience_years=_coerce_years(data.get("preferred_experience_years"), "preferred_experience_years"),
         requires_degree=data["requires_degree"],
         is_strictly_full_time=data["is_strictly_full_time"],
         evidence=evidence.strip()[:600],
+        seniority_level=seniority if seniority in SENIORITY_LEVELS else "unclear",
+        implicit_concerns=_parse_concerns(data.get("implicit_concerns")),
+        salary=_parse_salary(data.get("salary")),
         model=model,
     )
 
@@ -196,15 +451,15 @@ class ExtractionCache:
         if not row:
             return None
         try:
-            return RequirementExtraction(**json.loads(row[0]))
-        except (TypeError, ValueError):
+            return RequirementExtraction.from_json(row[0])
+        except (TypeError, ValueError, KeyError):
             return None
 
     def put(self, key: str, result: RequirementExtraction) -> None:
         with self.conn:
             self.conn.execute(
                 "INSERT OR REPLACE INTO extractions (cache_key, result_json, created_at) VALUES (?, ?, ?)",
-                (key, json.dumps(result.__dict__, ensure_ascii=False), time.time()),
+                (key, result.to_json(), time.time()),
             )
 
     def close(self) -> None:
@@ -213,6 +468,15 @@ class ExtractionCache:
 
 # (system_instruction, user_prompt) -> raw JSON text
 LLMCallFn = Callable[[str, str], str]
+
+# Items accepted by extract_many: (title, description) or (title, description, salary_raw)
+ExtractionItem = Union[Tuple[str, str], Tuple[str, str, Optional[str]]]
+
+
+def _unpack(item: ExtractionItem) -> Tuple[str, str, Optional[str]]:
+    title, description = item[0], item[1]
+    salary = item[2] if len(item) > 2 else None
+    return title, description, salary
 
 
 class AgenticExtractor:
@@ -243,6 +507,8 @@ class AgenticExtractor:
         self.last_errors: List[str] = []
 
         if call_fn is None:
+            if not os.environ.get("GEMINI_API_KEY"):
+                load_env()
             try:
                 from google import genai  # lazy: keeps the rest of the pipeline dependency-free
                 self._client = genai.Client()
@@ -258,13 +524,13 @@ class AgenticExtractor:
         """Folded into the evaluator version so cached evaluations track the extractor."""
         return f"llm:{self.model}:p{PROMPT_VERSION}"
 
-    def cache_key(self, title: str, description: str) -> str:
-        payload = f"{PROMPT_VERSION}|{self.model}|{title}|{(description or '')[:MAX_DESCRIPTION_CHARS]}"
+    def cache_key(self, title: str, description: str, salary: Optional[str] = None) -> str:
+        payload = f"{PROMPT_VERSION}|{self.model}|{title}|{salary or ''}|{(description or '')[:MAX_DESCRIPTION_CHARS]}"
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     # ------------------------------------------------------------- calling
-    def _call_model(self, title: str, description: str) -> str:
-        prompt = build_prompt(title, description)
+    def _call_model(self, title: str, description: str, salary: Optional[str]) -> str:
+        prompt = build_prompt(title, description, salary)
         if self._call_fn is not None:
             return self._call_fn(SYSTEM_INSTRUCTION, prompt)
         interaction = self._client.interactions.create(
@@ -280,29 +546,32 @@ class AgenticExtractor:
         )
         return interaction.output_text or ""
 
-    def _extract_uncached(self, title: str, description: str) -> Tuple[Optional[RequirementExtraction], Optional[str]]:
+    def _extract_uncached(
+        self, title: str, description: str, salary: Optional[str]
+    ) -> Tuple[Optional[RequirementExtraction], Optional[str]]:
         last_err: Optional[str] = None
         for attempt in range(self.max_attempts):
             try:
-                return parse_extraction(self._call_model(title, description), model=self.model), None
+                return parse_extraction(self._call_model(title, description, salary), model=self.model), None
             except Exception as e:  # network / 429 / schema violation -> retry with backoff
                 last_err = f"{type(e).__name__}: {e}"
                 if attempt + 1 < self.max_attempts:
                     time.sleep(1.5 * (2 ** attempt))
         return None, last_err
 
-    def extract(self, title: str, description: str) -> Optional[RequirementExtraction]:
-        return self.extract_many([(title, description)])[0]
+    def extract(self, title: str, description: str, salary: Optional[str] = None) -> Optional[RequirementExtraction]:
+        return self.extract_many([(title, description, salary)])[0]
 
-    def extract_many(self, items: Sequence[Tuple[str, str]]) -> List[Optional[RequirementExtraction]]:
-        """Extract for many (title, description) pairs; cache hits skip the model entirely."""
+    def extract_many(self, items: Sequence[ExtractionItem]) -> List[Optional[RequirementExtraction]]:
+        """Extract for many (title, description[, salary]) items; cache hits skip the model entirely."""
         results: List[Optional[RequirementExtraction]] = [None] * len(items)
         if not self.available or not items:
             return results
 
+        unpacked = [_unpack(it) for it in items]
         misses: List[Tuple[int, str]] = []
-        for i, (title, desc) in enumerate(items):
-            key = self.cache_key(title, desc)
+        for i, (title, desc, salary) in enumerate(unpacked):
+            key = self.cache_key(title, desc, salary)
             cached = self.cache.get(key) if self.cache else None
             if cached is not None:
                 results[i] = cached
@@ -313,7 +582,7 @@ class AgenticExtractor:
         if misses:
             with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
                 futures = {
-                    i: pool.submit(self._extract_uncached, items[i][0], items[i][1])
+                    i: pool.submit(self._extract_uncached, *unpacked[i])
                     for i, _ in misses
                 }
                 for i, key in misses:
@@ -332,6 +601,59 @@ class AgenticExtractor:
     def close(self) -> None:
         if self.cache:
             self.cache.close()
+
+
+# ---------------------------------------------------------------------------
+# Deterministic post-processing (no LLM): salary normalisation + evidence grounding
+# ---------------------------------------------------------------------------
+
+def normalize_salary_to_monthly_gross_eur(salary: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    """Convert raw salary facts to monthly gross EUR. Non-EUR / unknown-period salaries return (None, None)."""
+    if not salary or salary.get("currency") != "EUR":
+        return None, None
+    period_factor = {"month": 1.0, "year": 1 / 12, "hour": HOURS_PER_MONTH, "day": DAYS_PER_MONTH}.get(
+        salary.get("period", "unknown")
+    )
+    if period_factor is None:
+        return None, None
+    basis_factor = NET_TO_GROSS_FACTOR if salary.get("basis") == "net" else 1.0
+
+    def _conv(v):
+        return round(v * period_factor * basis_factor, 0) if v is not None else None
+
+    return _conv(salary.get("min")), _conv(salary.get("max"))
+
+
+def _norm_text(s: str) -> str:
+    return " ".join((s or "").lower().split())
+
+
+def is_quote_grounded(quote: str, source_text: str) -> bool:
+    """True if the (possibly '...'-elided) quote occurs verbatim in the listing (case/whitespace-insensitive)."""
+    haystack = _norm_text(source_text)
+    fragments = [_norm_text(f).strip(" \"'“”„.,;:") for f in quote.replace("…", "...").split("...")]
+    fragments = [f for f in fragments if len(f) >= 6]
+    return bool(fragments) and all(f in haystack for f in fragments)
+
+
+def _ground_concerns(concerns: List[ImplicitConcern], source_text: str) -> List[ImplicitConcern]:
+    """Anti-hallucination guard: a concern whose quote is not in the listing is downgraded one severity level."""
+    grounded: List[ImplicitConcern] = []
+    for c in concerns:
+        if is_quote_grounded(c.evidence, source_text):
+            grounded.append(c)
+            continue
+        idx = CONCERN_SEVERITIES.index(c.severity)
+        if idx == 0:
+            continue  # an unverifiable "low" concern is noise -> drop it
+        grounded.append(ImplicitConcern(
+            category=c.category,
+            severity=CONCERN_SEVERITIES[idx - 1],
+            description=f"{c.description} (quote not verified in listing; severity reduced)",
+            evidence=c.evidence,
+            source=c.source,
+        ))
+    return grounded
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +686,12 @@ def apply_extraction(job: NormalizedJob, ex: RequirementExtraction) -> Normalize
     elif job.education_requirements and "mandatory" in job.education_requirements.lower():
         job.education_requirements = None
 
+    # Holistic signals
+    source_text = f"{job.title}\n{job.salary or ''}\n{job.description}"
+    job.seniority_level = ex.seniority_level
+    job.implicit_concerns = _ground_concerns(ex.implicit_concerns, source_text)
+    job.salary_monthly_gross_eur_min, job.salary_monthly_gross_eur_max = normalize_salary_to_monthly_gross_eur(ex.salary)
+
     # Drop regex evidence that the semantic pass supersedes, then record the new facts.
     job.evidence = [e for e in job.evidence if not e.statement.startswith(_REGEX_EVIDENCE_PREFIXES)]
     req = "unstated" if ex.required_experience_years is None else f"{ex.required_experience_years} yrs"
@@ -372,10 +700,19 @@ def apply_extraction(job: NormalizedJob, ex: RequirementExtraction) -> Normalize
         fact_type=FactType.FACT,
         statement=(
             f"Semantic extraction ({ex.model or 'llm'}): required experience {req}, preferred {pref}, "
-            f"completed degree mandatory={ex.requires_degree}, strictly full-time={ex.is_strictly_full_time}."
+            f"completed degree mandatory={ex.requires_degree}, strictly full-time={ex.is_strictly_full_time}, "
+            f"assessed seniority={ex.seniority_level}, implicit concerns={len(job.implicit_concerns)}."
         ),
         source_reference=job.source,
     ))
+    if job.salary_monthly_gross_eur_min or job.salary_monthly_gross_eur_max:
+        lo = job.salary_monthly_gross_eur_min or "?"
+        hi = job.salary_monthly_gross_eur_max or "?"
+        job.evidence.append(EvidenceItem(
+            fact_type=FactType.INFERENCE,
+            statement=f"Salary normalised to {lo}-{hi} EUR gross/month (from {ex.salary}).",
+            source_reference=job.source,
+        ))
     if ex.evidence:
         job.evidence.append(EvidenceItem(
             fact_type=FactType.FACT,
@@ -399,6 +736,27 @@ SELF_CHECK_CASES = [
     ("Junior Developer", "Experience with Kubernetes for 3+ years is a plus. Students welcome.", lambda y: y in (0, None), "0/null"),
 ]
 
+# (title, description, salary, predicate on the extraction, label) - holistic concern detection
+SELF_CHECK_CONCERN_CASES = [
+    (
+        "AI Solutions Developer",
+        "You will own the end-to-end architecture of our GenAI platform, run discovery workshops with enterprise "
+        "customers and guide the technical direction of the team. Python, LLMs, Azure.",
+        "5000 - 6500 EUR bruto",
+        lambda ex: ex.seniority_level in ("senior", "lead_or_principal")
+        and any(c.severity in ("high", "critical") for c in ex.implicit_concerns),
+        "senior+concern",
+    ),
+    (
+        "AI Intern",
+        "Internship for university students. You will help the team label data and write small Python scripts. Flexible hours.",
+        "1000 EUR bruto",
+        lambda ex: ex.seniority_level == "student_or_intern"
+        and not any(c.severity in ("high", "critical") for c in ex.implicit_concerns),
+        "clean",
+    ),
+]
+
 
 def _self_check() -> int:
     from .normalize import extract_experience_rules
@@ -416,9 +774,21 @@ def _self_check() -> int:
         ok = ex is not None and check(ex.required_experience_years)
         failures += 0 if ok else 1
         print(f"[{'PASS' if ok else 'FAIL'}] expect {label:<6} llm={llm_years!s:<5} regex={regex_years}{'(mand)' if regex_mand else ''}  | {desc[:70]}")
+
+    concern_results = extractor.extract_many([(t, d, s) for t, d, s, _, _ in SELF_CHECK_CONCERN_CASES])
+    for (title, desc, salary, check, label), ex in zip(SELF_CHECK_CONCERN_CASES, concern_results):
+        ok = ex is not None and check(ex)
+        failures += 0 if ok else 1
+        summary = "ERROR" if ex is None else (
+            f"level={ex.seniority_level} concerns="
+            + ", ".join(f"{c.category}:{c.severity}" for c in ex.implicit_concerns)
+        )
+        print(f"[{'PASS' if ok else 'FAIL'}] expect {label:<14} {summary} | {title}")
+
     if extractor.last_errors:
         print("Errors:", *extractor.last_errors[:3], sep="\n  ")
-    print(f"\n{len(SELF_CHECK_CASES) - failures}/{len(SELF_CHECK_CASES)} passed (model: {extractor.model})")
+    total = len(SELF_CHECK_CASES) + len(SELF_CHECK_CONCERN_CASES)
+    print(f"\n{total - failures}/{total} passed (model: {extractor.model})")
     return 0 if failures == 0 else 1
 
 

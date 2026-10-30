@@ -27,6 +27,31 @@ class Recommendation(str, Enum):
     REJECT = "REJECT"
 
 
+class ApplicationStatus(str, Enum):
+    NEW = "NEW"
+    SAVED = "SAVED"
+    APPLIED = "APPLIED"
+    INTERVIEW = "INTERVIEW"
+    OFFER = "OFFER"
+    ARCHIVED = "ARCHIVED"
+
+
+APPLICATION_STATUSES = tuple(s.value for s in ApplicationStatus)
+ACTIVE_APPLICATION_STATUSES = (
+    ApplicationStatus.NEW.value,
+    ApplicationStatus.SAVED.value,
+    ApplicationStatus.APPLIED.value,
+    ApplicationStatus.INTERVIEW.value,
+    ApplicationStatus.OFFER.value,
+)
+PINNED_APPLICATION_STATUSES = (
+    ApplicationStatus.SAVED.value,
+    ApplicationStatus.APPLIED.value,
+    ApplicationStatus.INTERVIEW.value,
+    ApplicationStatus.OFFER.value,
+)
+
+
 class FactType(str, Enum):
     FACT = "FACT"
     INFERENCE = "INFERENCE"
@@ -42,6 +67,43 @@ class EvidenceItem:
     def format(self) -> str:
         ref_part = f" (Source: {self.source_reference})" if self.source_reference else ""
         return f"[{self.fact_type.value}] {self.statement}{ref_part}"
+
+
+# ---------------------------------------------------------------------------
+# Implicit concern taxonomy (closed vocabulary shared by LLM schema + evaluator)
+# ---------------------------------------------------------------------------
+
+CONCERN_CATEGORIES = (
+    "implicit_seniority",          # architecture ownership, tech leadership, mentoring, strategy
+    "client_facing_leadership",    # leading customer workshops, pre-sales, consulting, exec stakeholders
+    "people_management",           # line management, hiring, team lead duties
+    "production_ownership",        # sole/primary accountability for critical production systems, SLAs
+    "demanding_schedule",          # shifts, nights/weekends, on-call, overtime, heavy travel
+    "high_pressure_environment",   # aggressive KPIs/quotas, solo "wear all hats", crunch culture
+    "advanced_expertise",          # PhD/research track record, expert-level niche depth, pro certifications
+    "eligibility_constraint",      # clearance, citizenship, driving licence + own car, relocation
+    "other",
+)
+
+# Ordered from least to most severe.
+CONCERN_SEVERITIES = ("low", "medium", "high", "critical")
+
+SENIORITY_LEVELS = ("student_or_intern", "junior", "mid", "senior", "lead_or_principal", "unclear")
+
+
+@dataclass
+class ImplicitConcern:
+    """A red flag for a student candidate that is implied rather than explicitly required.
+
+    source:  "llm" (semantic extraction), "seniority_assessment" or "salary" (derived by the evaluator).
+    penalty: points deducted by the evaluator (0.0 on NormalizedJob, set on EvaluationResult).
+    """
+    category: str
+    severity: str
+    description: str
+    evidence: str = ""
+    source: str = "llm"
+    penalty: float = 0.0
 
 
 @dataclass
@@ -98,6 +160,11 @@ class NormalizedJob:
     required_experience_years: Optional[int] = None
     is_strictly_full_time: Optional[bool] = None
     extraction_method: str = "regex"
+    # Holistic signals (LLM-only; empty/None when semantic extraction did not run)
+    implicit_concerns: List[ImplicitConcern] = field(default_factory=list)
+    seniority_level: Optional[str] = None
+    salary_monthly_gross_eur_min: Optional[float] = None
+    salary_monthly_gross_eur_max: Optional[float] = None
     language_requirements: List[str] = field(default_factory=list)
     technical_keywords: List[str] = field(default_factory=list)
     posted_date: Optional[str] = None
@@ -108,6 +175,9 @@ class NormalizedJob:
     discovery_timestamp: str = ""
     duplicate_sources: List[Dict[str, str]] = field(default_factory=list)
     evidence: List[EvidenceItem] = field(default_factory=list)
+    application_status: ApplicationStatus = ApplicationStatus.NEW
+    user_notes: str = ""
+    is_active: bool = True
 
 
 @dataclass
@@ -120,6 +190,8 @@ class ScoreBreakdown:
     technical_skill_overlap: float
     language_compatibility: float
     total_score: float
+    # Negative adjustment (stored as a positive number) from implicit concerns.
+    implicit_concern_penalty: float = 0.0
 
 
 @dataclass
@@ -137,6 +209,11 @@ class EvaluationResult:
     concerns: List[str] = field(default_factory=list)
     evidence_items: List[EvidenceItem] = field(default_factory=list)
     application_message_draft: Optional[str] = None
+    # Every implicit concern that was scored, with its applied penalty (sorted by severity).
+    implicit_concerns: List[ImplicitConcern] = field(default_factory=list)
+    application_status: ApplicationStatus = ApplicationStatus.NEW
+    user_notes: str = ""
+    is_active: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -166,11 +243,20 @@ def _evidence_from_dict(d: Dict[str, Any]) -> EvidenceItem:
     )
 
 
+def _concern_from_dict(d: Dict[str, Any]) -> ImplicitConcern:
+    return ImplicitConcern(**d)
+
+
 def normalized_job_from_dict(d: Dict[str, Any]) -> NormalizedJob:
     data = dict(d)
     data["work_mode"] = WorkMode(data["work_mode"])
     data["employment_type"] = EmploymentType(data["employment_type"])
     data["evidence"] = [_evidence_from_dict(e) for e in data.get("evidence", [])]
+    data["implicit_concerns"] = [_concern_from_dict(c) for c in data.get("implicit_concerns", [])]
+    raw_status = data.get("application_status")
+    data["application_status"] = ApplicationStatus(raw_status) if raw_status else ApplicationStatus.NEW
+    data["user_notes"] = data.get("user_notes") or ""
+    data["is_active"] = bool(data.get("is_active", True))
     return NormalizedJob(**data)
 
 
@@ -180,4 +266,14 @@ def evaluation_from_dict(d: Dict[str, Any]) -> EvaluationResult:
     data["score_breakdown"] = ScoreBreakdown(**data["score_breakdown"])
     data["recommendation"] = Recommendation(data["recommendation"])
     data["evidence_items"] = [_evidence_from_dict(e) for e in data.get("evidence_items", [])]
+    data["implicit_concerns"] = [_concern_from_dict(c) for c in data.get("implicit_concerns", [])]
+    raw_status = data.get("application_status")
+    data["application_status"] = (
+        ApplicationStatus(raw_status) if raw_status else data["normalized_job"].application_status
+    )
+    data["user_notes"] = data.get("user_notes") if data.get("user_notes") is not None else data["normalized_job"].user_notes
+    data["is_active"] = bool(data["is_active"]) if "is_active" in data else data["normalized_job"].is_active
+    data["normalized_job"].application_status = data["application_status"]
+    data["normalized_job"].user_notes = data["user_notes"]
+    data["normalized_job"].is_active = data["is_active"]
     return EvaluationResult(**data)

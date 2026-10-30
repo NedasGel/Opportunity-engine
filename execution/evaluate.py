@@ -1,13 +1,42 @@
 import re
-from typing import List, Tuple
+from dataclasses import replace
+from typing import List, Optional, Tuple
 from .models import (
     NormalizedJob, CandidateProfile, EvaluationResult, ScoreBreakdown,
-    Recommendation, WorkMode, EmploymentType, EvidenceItem, FactType
+    Recommendation, WorkMode, EmploymentType, EvidenceItem, FactType,
+    ImplicitConcern, CONCERN_SEVERITIES,
 )
 
 # Bump whenever scoring rules/thresholds change. The state store re-evaluates
 # any cached result whose stored evaluator_version differs from this value.
-EVALUATOR_VERSION = "2"
+EVALUATOR_VERSION = "3"
+
+# Maximum points per scoring component (single source of truth for reports / dashboard).
+SCORE_COMPONENT_MAX = {
+    "ai_relevance": 40.0,
+    "technical_skill_overlap": 15.0,
+    "student_compatibility": 20.0,
+    "schedule_compatibility": 10.0,
+    "location_compatibility": 10.0,
+    "language_compatibility": 5.0,
+}
+MAX_TOTAL_SCORE = sum(SCORE_COMPONENT_MAX.values())  # 100.0
+
+# ---------------------------------------------------------------------------
+# Implicit concern policy (signals come from the LLM; ALL scoring decisions are here)
+# ---------------------------------------------------------------------------
+SEVERITY_PENALTY = {"low": 2.0, "medium": 5.0, "high": 10.0, "critical": 15.0}
+# Repeated concerns in the same category corroborate rather than add independent risk.
+REPEAT_CATEGORY_FACTOR = 0.5
+MAX_IMPLICIT_PENALTY = 25.0
+# Monthly gross EUR (Lithuania): a salary floor at these levels signals a non-student role.
+SALARY_SENIOR_FLOOR_EUR = 5000.0
+SALARY_MID_FLOOR_EUR = 3500.0
+# Escalation gates: N high-severity concerns cap the best achievable recommendation.
+HIGH_CONCERNS_FOR_LOW_PRIORITY = 2
+IMPLICIT_BLOCKER_PREFIX = "Implicit concern - "
+
+_TIER_ORDER = [Recommendation.APPLY, Recommendation.CONSIDER, Recommendation.LOW_PRIORITY, Recommendation.REJECT]
 
 
 LITHUANIAN_CITIES = [
@@ -179,6 +208,94 @@ def _matches_any(patterns: List[str], text: str) -> bool:
     return False
 
 
+def _cap_recommendation(current: Recommendation, best_allowed: Recommendation) -> Recommendation:
+    """Return the worse of the two tiers (APPLY < CONSIDER < LOW_PRIORITY < REJECT)."""
+    return max(current, best_allowed, key=_TIER_ORDER.index)
+
+
+def _downgrade(severity: str) -> Optional[str]:
+    idx = CONCERN_SEVERITIES.index(severity)
+    return CONCERN_SEVERITIES[idx - 1] if idx > 0 else None
+
+
+def derive_implicit_concerns(job: NormalizedJob, is_student_friendly: bool) -> List[ImplicitConcern]:
+    """
+    Merge LLM-detected concerns with signals derived deterministically from structured facts
+    (holistic seniority level, normalised salary). All derived signals share the
+    `implicit_seniority` category so corroborating evidence gets diminishing returns.
+    """
+    signals: List[ImplicitConcern] = [
+        replace(c, penalty=0.0) for c in job.implicit_concerns if c.severity in SEVERITY_PENALTY
+    ]
+
+    level = job.seniority_level
+    if level in ("senior", "lead_or_principal"):
+        label = "Senior" if level == "senior" else "Lead / Principal"
+        signals.append(ImplicitConcern(
+            category="implicit_seniority",
+            # An explicit internship/working-student framing contradicts the assessment -> soften.
+            severity="high" if is_student_friendly else "critical",
+            description=f"Holistic assessment: scope, autonomy and responsibilities are pitched at {label} level.",
+            evidence=f"seniority_level={level}",
+            source="seniority_assessment",
+        ))
+    elif level == "mid":
+        signals.append(ImplicitConcern(
+            category="implicit_seniority",
+            severity="medium" if is_student_friendly else "high",
+            description="Holistic assessment: role expects an independent mid-level contributor, not a learner.",
+            evidence="seniority_level=mid",
+            source="seniority_assessment",
+        ))
+
+    lo, hi = job.salary_monthly_gross_eur_min, job.salary_monthly_gross_eur_max
+    ref = lo if lo is not None else hi
+    if ref is not None:
+        severity: Optional[str] = None
+        tier = ""
+        if ref >= SALARY_SENIOR_FLOOR_EUR:
+            severity, tier = "high", "senior"
+        elif ref >= SALARY_MID_FLOOR_EUR:
+            severity, tier = "medium", "mid-level"
+        if severity and lo is None:
+            severity = _downgrade(severity)  # only an upper bound ("up to X") -> weaker signal
+        if severity:
+            signals.append(ImplicitConcern(
+                category="implicit_seniority",
+                severity=severity,
+                description=(
+                    f"Salary of ~{ref:,.0f} EUR gross/month is typical of {tier} roles in Lithuania, "
+                    f"not student positions."
+                ),
+                evidence=job.salary or f"{ref:.0f} EUR gross/month",
+                source="salary",
+            ))
+    return signals
+
+
+def score_implicit_concerns(signals: List[ImplicitConcern]) -> Tuple[float, List[ImplicitConcern]]:
+    """
+    Convert concern signals into a bounded penalty.
+      * severity -> base points (SEVERITY_PENALTY)
+      * 2nd+ concern in the same category counts at REPEAT_CATEGORY_FACTOR
+      * total capped at MAX_IMPLICIT_PENALTY
+    Returns (total_penalty, concerns sorted most-severe-first with `penalty` filled in).
+    """
+    ordered = sorted(signals, key=lambda c: CONCERN_SEVERITIES.index(c.severity), reverse=True)
+    seen_categories = set()
+    total = 0.0
+    scored: List[ImplicitConcern] = []
+    for c in ordered:
+        base = SEVERITY_PENALTY[c.severity]
+        if c.category in seen_categories:
+            base *= REPEAT_CATEGORY_FACTOR
+        seen_categories.add(c.category)
+        applied = round(max(0.0, min(base, MAX_IMPLICIT_PENALTY - total)), 1)
+        total += applied
+        scored.append(replace(c, penalty=applied))
+    return round(total, 1), scored
+
+
 def evaluate_job(job: NormalizedJob, profile: CandidateProfile) -> EvaluationResult:
     """
     Deterministically evaluates a job against the candidate profile based on a calibrated 100-point model:
@@ -188,9 +305,12 @@ def evaluate_job(job: NormalizedJob, profile: CandidateProfile) -> EvaluationRes
     - Schedule Compatibility: 10 points
     - Location/Work Mode: 10 points
     - Language Compatibility: 5 points
+    minus an Implicit Concern Penalty (0-25 points) for implied red flags (implicit seniority,
+    client-facing leadership, demanding schedules, senior-level salary, ...).
 
     AI/domain + technical overlap account for 55% of the total score.
     APPLY gate requires total_score >= 75.0 AND ai_relevance >= 26.0.
+    Implicit concern gates: any critical -> REJECT; >=2 high -> at best LOW_PRIORITY; 1 high -> at best CONSIDER.
     """
     hard_blockers: List[str] = []
     soft_penalties: List[str] = []
@@ -489,10 +609,35 @@ def evaluate_job(job: NormalizedJob, profile: CandidateProfile) -> EvaluationRes
         strong_matches.append("Language requirements (Lithuanian / English) match candidate.")
 
     # ---------------------------------------------------------
+    # 7. Implicit Concerns (Penalty, max -25.0 pts)
+    # Signals are detected semantically by the LLM extractor; policy is applied here.
+    # ---------------------------------------------------------
+    implicit_signals = derive_implicit_concerns(job, is_student_friendly)
+    implicit_penalty, scored_concerns = score_implicit_concerns(implicit_signals)
+    high_concern_count = 0
+    for c in scored_concerns:
+        if c.severity == "critical":
+            hard_blockers.append(
+                f"{IMPLICIT_BLOCKER_PREFIX}{c.category.replace('_', ' ')}: {c.description}"
+            )
+        elif c.severity == "high":
+            high_concern_count += 1
+    if scored_concerns:
+        evidence_items.append(EvidenceItem(
+            fact_type=FactType.INFERENCE,
+            statement=(
+                f"Implicit concerns: {len(scored_concerns)} detected, -{implicit_penalty} pts "
+                f"(" + ", ".join(f"{c.category}:{c.severity}" for c in scored_concerns) + ")."
+            ),
+        ))
+    if job.extraction_method != "llm":
+        missing_info.append("Implicit concern analysis unavailable (semantic LLM extraction not run for this listing).")
+
+    # ---------------------------------------------------------
     # Calculate Total Score & Recommendation
     # ---------------------------------------------------------
-    raw_total = ai_relevance_pts + tech_pts + exp_pts + sched_pts + loc_pts + lang_pts
-    total_score = round(raw_total, 1)
+    raw_total = ai_relevance_pts + tech_pts + exp_pts + sched_pts + loc_pts + lang_pts - implicit_penalty
+    total_score = round(max(0.0, raw_total), 1)
 
     # Determine Recommendation Tier
     if hard_blockers or is_non_tech:
@@ -513,6 +658,20 @@ def evaluate_job(job: NormalizedJob, profile: CandidateProfile) -> EvaluationRes
         recommendation = Recommendation.LOW_PRIORITY
     else:
         recommendation = Recommendation.REJECT
+
+    # Escalation gates from high-severity implicit concerns (critical ones are already hard blockers).
+    if recommendation != Recommendation.REJECT and high_concern_count:
+        best_allowed = (
+            Recommendation.LOW_PRIORITY if high_concern_count >= HIGH_CONCERNS_FOR_LOW_PRIORITY
+            else Recommendation.CONSIDER
+        )
+        capped = _cap_recommendation(recommendation, best_allowed)
+        if capped != recommendation:
+            soft_penalties.append(
+                f"Recommendation capped at {capped.value} (was {recommendation.value}) due to "
+                f"{high_concern_count} high-severity implicit concern(s)."
+            )
+            recommendation = capped
 
     # Add evidence for recommendation
     evidence_items.append(EvidenceItem(
@@ -553,7 +712,8 @@ def evaluate_job(job: NormalizedJob, profile: CandidateProfile) -> EvaluationRes
         education_compatibility=0.0,
         technical_skill_overlap=tech_pts,
         language_compatibility=lang_pts,
-        total_score=total_score
+        total_score=total_score,
+        implicit_concern_penalty=implicit_penalty,
     )
 
     return EvaluationResult(
@@ -569,5 +729,6 @@ def evaluate_job(job: NormalizedJob, profile: CandidateProfile) -> EvaluationRes
         missing_information=missing_info,
         concerns=concerns,
         evidence_items=evidence_items,
-        application_message_draft=draft_msg
+        application_message_draft=draft_msg,
+        implicit_concerns=scored_concerns,
     )
